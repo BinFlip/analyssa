@@ -37,8 +37,10 @@
 //! }
 //! ```
 
-use std::collections::HashMap;
-use std::hash::Hash;
+use std::{
+    collections::{HashMap, HashSet},
+    hash::Hash,
+};
 
 use crate::{
     graph::{algorithms, DirectedGraph, NodeId},
@@ -70,6 +72,9 @@ where
     key_to_node: HashMap<K, NodeId>,
     /// Map from `NodeId` to domain key
     node_to_key: HashMap<NodeId, K>,
+    /// Existing `(source, target)` edges, for O(1) duplicate detection in
+    /// [`add_edge`](Self::add_edge) instead of scanning the source's successors.
+    edge_set: HashSet<(NodeId, NodeId)>,
 }
 
 impl<K, E> Default for IndexedGraph<K, E>
@@ -92,6 +97,7 @@ where
             graph: DirectedGraph::new(),
             key_to_node: HashMap::new(),
             node_to_key: HashMap::new(),
+            edge_set: HashSet::new(),
         }
     }
 
@@ -102,6 +108,7 @@ where
             graph: DirectedGraph::with_capacity(node_capacity, edge_capacity),
             key_to_node: HashMap::with_capacity(node_capacity),
             node_to_key: HashMap::with_capacity(node_capacity),
+            edge_set: HashSet::with_capacity(edge_capacity),
         }
     }
 
@@ -154,8 +161,8 @@ where
         let from_node = self.add_node(from);
         let to_node = self.add_node(to);
 
-        // Check if edge already exists
-        if self.graph.successors(from_node).any(|s| s == to_node) {
+        // O(1) duplicate check via the edge set.
+        if !self.edge_set.insert((from_node, to_node)) {
             return Ok(false);
         }
 

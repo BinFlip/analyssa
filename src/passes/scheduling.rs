@@ -40,7 +40,7 @@
 //! | [`OpaquePredicatePass<T>`] | 1 | [`super::predicates`] | CfgModifying |
 //! | [`ReassociationPass`] | 1 | [`super::reassociate`] | InstructionsOnly |
 //! | [`StrengthReductionPass`] | 1 | [`super::strength`] | InstructionsOnly |
-//! | [`ValueRangePropagationPass`] | 1 | [`super::ranges`] | InstructionsOnly |
+//! | [`ValueRangePropagationPass`] | 1 | [`super::ranges`] | CfgModifying |
 
 use crate::{
     error::Result,
@@ -96,6 +96,10 @@ where
         ModificationScope::InstructionsOnly
     }
 
+    fn repairs_ssa(&self) -> bool {
+        true
+    }
+
     fn run_on_method(
         &self,
         ssa: &mut SsaFunction<T>,
@@ -149,6 +153,10 @@ where
 
     fn description(&self) -> &'static str {
         "Eliminate trampoline (single-jump) blocks"
+    }
+
+    fn repairs_ssa(&self) -> bool {
+        true
     }
 
     fn run_on_method(
@@ -211,6 +219,10 @@ where
 
     fn description(&self) -> &'static str {
         "Simplify branches, eliminate unreachable code, fold constant predicates"
+    }
+
+    fn repairs_ssa(&self) -> bool {
+        true
     }
 
     fn run_on_method(
@@ -276,6 +288,10 @@ where
 
     fn modification_scope(&self) -> ModificationScope {
         ModificationScope::InstructionsOnly
+    }
+
+    fn repairs_ssa(&self) -> bool {
+        true
     }
 
     fn run_on_method(
@@ -488,6 +504,10 @@ where
         "Hoist loop-invariant computations out of loops"
     }
 
+    fn repairs_ssa(&self) -> bool {
+        true
+    }
+
     fn run_on_method(
         &self,
         ssa: &mut SsaFunction<T>,
@@ -533,6 +553,10 @@ where
         "Ensure each loop has a single preheader and latch"
     }
 
+    fn repairs_ssa(&self) -> bool {
+        true
+    }
+
     fn run_on_method(
         &self,
         ssa: &mut SsaFunction<T>,
@@ -563,6 +587,10 @@ where
         "Remove always-true/false conditions, simplify trivial comparisons"
     }
 
+    fn repairs_ssa(&self) -> bool {
+        true
+    }
+
     fn run_on_method(
         &self,
         ssa: &mut SsaFunction<T>,
@@ -586,8 +614,8 @@ where
 ///
 /// # Modification scope
 ///
-/// [`ModificationScope::InstructionsOnly`] — replaces instructions,
-/// never changes the CFG.
+/// [`ModificationScope::CfgModifying`] — can replace conditional branches
+/// with unconditional jumps, changing CFG edges.
 #[derive(Debug, Clone, Copy)]
 pub struct ValueRangePropagationPass {
     /// Cap on iterations of the inner range-prop loop.
@@ -626,7 +654,11 @@ where
     }
 
     fn modification_scope(&self) -> ModificationScope {
-        ModificationScope::InstructionsOnly
+        ModificationScope::CfgModifying
+    }
+
+    fn repairs_ssa(&self) -> bool {
+        true
     }
 
     fn run_on_method(
@@ -685,6 +717,10 @@ where
         ModificationScope::InstructionsOnly
     }
 
+    fn repairs_ssa(&self) -> bool {
+        true
+    }
+
     fn run_on_method(
         &self,
         ssa: &mut SsaFunction<T>,
@@ -737,6 +773,10 @@ where
         ModificationScope::InstructionsOnly
     }
 
+    fn repairs_ssa(&self) -> bool {
+        true
+    }
+
     fn run_on_method(
         &self,
         ssa: &mut SsaFunction<T>,
@@ -787,6 +827,10 @@ where
 
     fn description(&self) -> &'static str {
         "Thread jumps through empty or predictable blocks"
+    }
+
+    fn repairs_ssa(&self) -> bool {
+        true
     }
 
     fn run_on_method(

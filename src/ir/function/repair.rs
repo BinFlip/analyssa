@@ -68,9 +68,9 @@ impl<T: Target> SsaFunction<T> {
         }
 
         self.strip_nops();
+        self.refresh_def_sites();
         self.eliminate_trivial_phis(&TrivialPhiOptions { reachable: None });
         self.eliminate_dead_phis();
         self.compact_variables();
-        self.reindex_variables();
     }
 }

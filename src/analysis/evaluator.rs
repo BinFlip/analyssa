@@ -1081,9 +1081,32 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
             return 0;
         }
 
+        // Only variables defined inside the loop can change between iterations;
+        // values defined outside are invariant during loop evaluation. Snapshot
+        // and compare just those instead of deep-cloning the entire value map
+        // every iteration.
+        let mut loop_vars: Vec<SsaVarId> = Vec::new();
+        for &block_idx in loop_blocks {
+            if let Some(block) = self.ssa.block(block_idx) {
+                for phi in block.phi_nodes() {
+                    loop_vars.push(phi.result());
+                }
+                for instr in block.instructions() {
+                    for dest in instr.op().defs() {
+                        loop_vars.push(dest);
+                    }
+                }
+            }
+        }
+        loop_vars.sort_unstable();
+        loop_vars.dedup();
+
         for iteration in 0..max_iterations {
-            // Snapshot current values
-            let snapshot: BTreeMap<SsaVarId, SymbolicExpr<T>> = self.values.clone();
+            // Snapshot only the loop-defined values.
+            let snapshot: Vec<Option<SymbolicExpr<T>>> = loop_vars
+                .iter()
+                .map(|v| self.values.get(v).cloned())
+                .collect();
 
             // Evaluate all loop blocks
             for (i, &block_idx) in loop_blocks.iter().enumerate() {
@@ -1100,8 +1123,12 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                 self.evaluate_block(block_idx);
             }
 
-            // Check if values changed
-            if self.values_match(&snapshot) {
+            // Fixed point reached when no loop-defined value changed.
+            let stable = loop_vars
+                .iter()
+                .zip(snapshot.iter())
+                .all(|(v, old)| self.values.get(v) == old.as_ref());
+            if stable {
                 return iteration.saturating_add(1);
             }
         }
@@ -1109,11 +1136,6 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
         // Didn't reach fixed point - mark variables that changed as widened
         self.widen_unstable_values(loop_blocks);
         max_iterations
-    }
-
-    /// Checks if current values match a snapshot.
-    fn values_match(&self, snapshot: &BTreeMap<SsaVarId, SymbolicExpr<T>>) -> bool {
-        self.values == *snapshot
     }
 
     /// Widens values that didn't stabilize in a loop to Unknown.
@@ -1134,8 +1156,8 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
 
             // Check instructions for variables that might not have stabilized
             for instr in block.instructions() {
-                // If this op defines a variable, consider widening it
-                if let Some(dest) = instr.op().dest() {
+                // If this op defines variables, consider widening them
+                for dest in instr.op().defs() {
                     // Keep concrete values if they're stable, widen symbolic to unknown
                     if let Some(expr) = self.values.get(&dest) {
                         if !expr.is_constant() {
@@ -1748,6 +1770,12 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
     ) -> Option<SymbolicExpr<T>> {
         let left_expr = self.values.get(&left)?;
         let right_expr = self.values.get(&right)?;
+        if left_expr.reaches_recursive_depth_limit() || right_expr.reaches_recursive_depth_limit() {
+            let result = SymbolicExpr::variable(dest);
+            self.values.insert(dest, result.clone());
+            self.track_origin_state(dest, &result);
+            return Some(result);
+        }
 
         // Build expression and simplify (handles constant folding automatically)
         let result = SymbolicExpr::binary(op, left_expr.clone(), right_expr.clone())
@@ -1769,6 +1797,12 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
         op: SymbolicOp,
     ) -> Option<SymbolicExpr<T>> {
         let operand_expr = self.values.get(&operand)?;
+        if operand_expr.reaches_recursive_depth_limit() {
+            let result = SymbolicExpr::variable(dest);
+            self.values.insert(dest, result.clone());
+            self.track_origin_state(dest, &result);
+            return Some(result);
+        }
 
         // Build expression and simplify
         let result = SymbolicExpr::unary(op, operand_expr.clone()).simplify(self.pointer_size);

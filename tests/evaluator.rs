@@ -1,8 +1,6 @@
 //! Path-aware evaluator tests: concrete and symbolic evaluation, phi-aware
 //! path tracing, constraint solving, loop fixpoint evaluation.
 
-#![allow(clippy::unwrap_used)]
-
 use analyssa::{
     analysis::evaluator::{ControlFlow, SsaEvaluator},
     ir::{

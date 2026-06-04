@@ -35,14 +35,14 @@
 //! top to bottom). Each iteration processes each block at most once via
 //! the worklist deduplication flag.
 
-use std::collections::VecDeque;
-use std::marker::PhantomData;
+use std::{cmp::Reverse, collections::BinaryHeap, marker::PhantomData};
 
 use crate::{
     analysis::dataflow::{
         framework::{AnalysisResults, DataFlowAnalysis, DataFlowCfg, Direction},
         lattice::MeetSemiLattice,
     },
+    bitset::BitSet,
     graph::NodeId,
     ir::function::SsaFunction,
     target::Target,
@@ -72,10 +72,19 @@ pub struct DataFlowSolver<T: Target, A: DataFlowAnalysis<T>> {
     in_states: Vec<A::Lattice>,
     /// Output state for each block.
     out_states: Vec<A::Lattice>,
-    /// Worklist of blocks to process.
-    worklist: VecDeque<usize>,
+    /// Worklist of blocks to process, prioritized by traversal order so blocks
+    /// are visited in (reverse) postorder. `Reverse((priority, block))` turns
+    /// the max-heap into a min-heap on the priority, which reduces fixpoint
+    /// iterations on loops compared with a plain FIFO.
+    worklist: BinaryHeap<Reverse<(usize, usize)>>,
     /// Whether each block is currently in the worklist (for deduplication).
     in_worklist: Vec<bool>,
+    /// Per-block traversal priority (position in RPO for forward analyses,
+    /// postorder for backward); smaller is processed first.
+    order_priority: Vec<usize>,
+    /// Exit blocks, precomputed once per solve for O(1) membership in the
+    /// backward solver hot loop (avoids re-allocating `cfg.exits()` per visit).
+    exit_blocks: BitSet,
     /// Number of iterations performed.
     iterations: usize,
     _phantom: PhantomData<T>,
@@ -89,8 +98,10 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
             analysis,
             in_states: Vec::new(),
             out_states: Vec::new(),
-            worklist: VecDeque::new(),
+            worklist: BinaryHeap::new(),
             in_worklist: Vec::new(),
+            order_priority: Vec::new(),
+            exit_blocks: BitSet::new(0),
             iterations: 0,
             _phantom: PhantomData,
         }
@@ -156,26 +167,40 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
                 }
             }
             Direction::Backward => {
-                // Exit blocks get boundary value
+                // Exit blocks get boundary value. Cache them in a BitSet so the
+                // backward fixpoint loop can test membership without rebuilding
+                // (and reallocating) `cfg.exits()` on every block visit.
+                let mut exit_blocks = BitSet::new(num_blocks);
                 for exit in cfg.exits() {
                     let idx = exit.index();
+                    exit_blocks.insert(idx);
                     if let Some(slot) = self.out_states.get_mut(idx) {
                         *slot = boundary.clone();
                     }
                 }
+                self.exit_blocks = exit_blocks;
             }
         }
 
-        // Add all blocks to worklist in appropriate order
+        // Assign each block a traversal priority (position in RPO for forward,
+        // postorder for backward) and seed the priority worklist with it.
         let order = match A::DIRECTION {
             Direction::Forward => cfg.reverse_postorder(),
             Direction::Backward => cfg.postorder(),
         };
 
-        for node in order {
+        self.order_priority = vec![usize::MAX; num_blocks];
+        for (pos, node) in order.iter().enumerate() {
+            if let Some(slot) = self.order_priority.get_mut(node.index()) {
+                *slot = pos;
+            }
+        }
+
+        for node in &order {
             let idx = node.index();
             if let Some(slot) = self.in_worklist.get_mut(idx) {
-                self.worklist.push_back(idx);
+                let prio = self.order_priority.get(idx).copied().unwrap_or(usize::MAX);
+                self.worklist.push(Reverse((prio, idx)));
                 *slot = true;
             }
         }
@@ -186,7 +211,7 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
     where
         A::Lattice: Clone,
     {
-        while let Some(block_idx) = self.worklist.pop_front() {
+        while let Some(Reverse((_, block_idx))) = self.worklist.pop() {
             if let Some(slot) = self.in_worklist.get_mut(block_idx) {
                 *slot = false;
             }
@@ -300,7 +325,7 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
         };
 
         // Special case: exit blocks keep their boundary value
-        if cfg.exits().contains(&node) {
+        if self.exit_blocks.contains(node.index()) {
             output = current_out.clone();
         }
 
@@ -328,14 +353,17 @@ impl<T: Target, A: DataFlowAnalysis<T>> DataFlowSolver<T, A> {
     fn add_affected_to_worklist<C: DataFlowCfg>(&mut self, block_idx: usize, cfg: &C) {
         let node = NodeId::new(block_idx);
 
-        let enqueue = |idx: usize, list: &mut Vec<bool>, work: &mut VecDeque<usize>| {
-            if let Some(slot) = list.get_mut(idx) {
-                if !*slot {
-                    work.push_back(idx);
-                    *slot = true;
+        let priority = &self.order_priority;
+        let enqueue =
+            |idx: usize, list: &mut Vec<bool>, work: &mut BinaryHeap<Reverse<(usize, usize)>>| {
+                if let Some(slot) = list.get_mut(idx) {
+                    if !*slot {
+                        let prio = priority.get(idx).copied().unwrap_or(usize::MAX);
+                        work.push(Reverse((prio, idx)));
+                        *slot = true;
+                    }
                 }
-            }
-        };
+            };
 
         match A::DIRECTION {
             Direction::Forward => {

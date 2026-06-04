@@ -1,6 +1,6 @@
 [package]
 name = "analyssa"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Johann Kempter <admin@binflip.rs>"]
 rust-version = "1.88"
@@ -28,8 +28,8 @@ indexing_slicing = "deny"
 [dependencies]
 thiserror = "2.0.18"
 boxcar = "0.2.14"
-dashmap = "6.1.0"
+dashmap = "6.2.1"
 rayon = "1.12.0"
-log = "0.4.29"
+log = "0.4.31"
 
 [dev-dependencies]

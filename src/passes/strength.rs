@@ -36,7 +36,12 @@ use crate::{
     analysis::DefUseIndex,
     bitset::BitSet,
     events::{EventKind, EventListener},
-    ir::{function::SsaFunction, ops::SsaOp, value::ConstValue, variable::SsaVarId},
+    ir::{
+        function::{SsaEditOptions, SsaFunction},
+        ops::SsaOp,
+        value::ConstValue,
+        variable::SsaVarId,
+    },
     passes::utils::is_power_of_two,
     target::Target,
 };
@@ -336,34 +341,54 @@ where
     L: EventListener<T> + ?Sized,
 {
     let mut changed = false;
-    for candidate in candidates {
-        if let Some(block) = ssa.block_mut(candidate.const_block) {
-            if let Some(const_instr) = block.instructions_mut().get_mut(candidate.const_instr) {
-                const_instr.set_op(SsaOp::Const {
+    let result = ssa.edit(SsaEditOptions::new(), |editor| {
+        for candidate in candidates {
+            let const_exists = editor
+                .function()
+                .block(candidate.const_block)
+                .and_then(|block| block.instruction(candidate.const_instr))
+                .is_some();
+            let op_exists = editor
+                .function()
+                .block(candidate.location.block_idx)
+                .and_then(|block| block.instruction(candidate.location.instr_idx))
+                .is_some();
+
+            if !const_exists || !op_exists {
+                continue;
+            }
+
+            editor.replace_instruction_op(
+                candidate.const_block,
+                candidate.const_instr,
+                SsaOp::Const {
                     dest: candidate.const_var,
                     value: candidate.new_const_value.clone(),
-                });
-            }
-        }
+                },
+            )?;
+            editor.replace_instruction_op(
+                candidate.location.block_idx,
+                candidate.location.instr_idx,
+                candidate.new_op,
+            )?;
 
-        if let Some(block) = ssa.block_mut(candidate.location.block_idx) {
-            if let Some(instr) = block
-                .instructions_mut()
-                .get_mut(candidate.location.instr_idx)
-            {
-                instr.set_op(candidate.new_op);
-                let event = crate::events::Event {
-                    kind: EventKind::StrengthReduced,
-                    method: Some(method.clone()),
-                    location: Some(candidate.location.instr_idx),
-                    message: candidate.description,
-                    pass: None,
-                };
-                events.push(event);
-                changed = true;
-            }
+            let event = crate::events::Event {
+                kind: EventKind::StrengthReduced,
+                method: Some(method.clone()),
+                location: Some(candidate.location.instr_idx),
+                message: candidate.description,
+                pass: None,
+            };
+            events.push(event);
+            changed = true;
         }
+        Ok(())
+    });
+
+    if result.is_err() {
+        return false;
     }
+
     changed
 }
 
@@ -378,7 +403,7 @@ mod tests {
             value::ConstValue,
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
-        testing::{MockTarget, MockType},
+        testing::{mock_op_at, run_mock_pass_boundary, MockTarget, MockType},
     };
 
     fn instr(op: SsaOp<MockTarget>) -> SsaInstruction<MockTarget> {
@@ -428,13 +453,13 @@ mod tests {
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run(&mut ssa, &0u32, &log, &|_| true);
+        let changed =
+            run_mock_pass_boundary(&mut ssa, "mul power-of-two strength reduction", |ssa| {
+                run(ssa, &0u32, &log, &|_| true)
+            });
         assert!(changed, "mul by power of two should reduce to shift");
         assert!(log.has(EventKind::StrengthReduced));
-        assert!(matches!(
-            ssa.block(0).unwrap().instruction(2).unwrap().op(),
-            SsaOp::Shl { .. }
-        ));
+        assert!(matches!(mock_op_at(&ssa, 0, 2), SsaOp::Shl { .. }));
     }
 
     #[test]
@@ -466,7 +491,10 @@ mod tests {
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run(&mut ssa, &0u32, &log, &|_| true);
+        let changed =
+            run_mock_pass_boundary(&mut ssa, "non-power-of-two strength reduction", |ssa| {
+                run(ssa, &0u32, &log, &|_| true)
+            });
         assert!(!changed, "mul by non-power-of-two should NOT reduce");
     }
 
@@ -500,11 +528,13 @@ mod tests {
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run(&mut ssa, &0u32, &log, &|_| true);
+        let changed = run_mock_pass_boundary(&mut ssa, "unsigned div strength reduction", |ssa| {
+            run(ssa, &0u32, &log, &|_| true)
+        });
         assert!(changed, "unsigned div by power of two should reduce");
         assert!(log.has(EventKind::StrengthReduced));
         assert!(matches!(
-            ssa.block(0).unwrap().instruction(2).unwrap().op(),
+            mock_op_at(&ssa, 0, 2),
             SsaOp::Shr { unsigned: true, .. }
         ));
     }
@@ -539,7 +569,9 @@ mod tests {
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run(&mut ssa, &0u32, &log, &|_| true);
+        let changed = run_mock_pass_boundary(&mut ssa, "signed div strength reduction", |ssa| {
+            run(ssa, &0u32, &log, &|_| true)
+        });
         assert!(
             changed,
             "signed div by power of two should reduce when non-negative"
@@ -577,7 +609,11 @@ mod tests {
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run(&mut ssa, &0u32, &log, &|_| false);
+        let changed = run_mock_pass_boundary(
+            &mut ssa,
+            "signed div unknown-sign strength reduction",
+            |ssa| run(ssa, &0u32, &log, &|_| false),
+        );
         assert!(
             !changed,
             "signed div should NOT reduce when non-negativity not proven"
@@ -614,21 +650,20 @@ mod tests {
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run(&mut ssa, &0u32, &log, &|_| true);
+        let changed = run_mock_pass_boundary(&mut ssa, "unsigned rem strength reduction", |ssa| {
+            run(ssa, &0u32, &log, &|_| true)
+        });
         assert!(changed, "unsigned rem by power of two should reduce to and");
         assert!(log.has(EventKind::StrengthReduced));
-        assert!(matches!(
-            ssa.block(0).unwrap().instruction(2).unwrap().op(),
-            SsaOp::And { .. }
-        ));
+        assert!(matches!(mock_op_at(&ssa, 0, 2), SsaOp::And { .. }));
     }
 
     #[test]
     fn multiple_reductions_in_one_run() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 5);
         let x = local_at(&mut ssa, 0, 0, 0);
-        let y = local_at(&mut ssa, 1, 0, 1);
-        let p1 = local_at(&mut ssa, 2, 0, 2);
+        let p1 = local_at(&mut ssa, 1, 0, 1);
+        let y = local_at(&mut ssa, 2, 0, 2);
         let p2 = local_at(&mut ssa, 3, 0, 3);
         let r1 = local_at(&mut ssa, 4, 0, 4);
         let r2 = local_at(&mut ssa, 5, 0, 5);
@@ -667,7 +702,9 @@ mod tests {
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run(&mut ssa, &0u32, &log, &|_| true);
+        let changed = run_mock_pass_boundary(&mut ssa, "multiple strength reductions", |ssa| {
+            run(ssa, &0u32, &log, &|_| true)
+        });
         assert!(changed, "multiple reductions should all fire");
         assert!(log.count_kind(EventKind::StrengthReduced) >= 2);
     }
@@ -701,7 +738,9 @@ mod tests {
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run(&mut ssa, &0u32, &log, &|_| true);
+        let changed = run_mock_pass_boundary(&mut ssa, "no-candidate strength reduction", |ssa| {
+            run(ssa, &0u32, &log, &|_| true)
+        });
         assert!(!changed, "no strength-reducible ops should return false");
     }
 
@@ -709,7 +748,9 @@ mod tests {
     fn empty_function_no_changes() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run(&mut ssa, &0u32, &log, &|_| true);
+        let changed = run_mock_pass_boundary(&mut ssa, "empty strength reduction", |ssa| {
+            run(ssa, &0u32, &log, &|_| true)
+        });
         assert!(!changed);
     }
 
@@ -747,7 +788,13 @@ mod tests {
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run(&mut ssa, &0u32, &log, &|_| true);
-        let _ = changed;
+        let changed =
+            run_mock_pass_boundary(&mut ssa, "shared constant strength reduction", |ssa| {
+                run(ssa, &0u32, &log, &|_| true)
+            });
+        assert!(
+            !changed,
+            "shared constant should not be rewritten for strength reduction"
+        );
     }
 }

@@ -23,7 +23,8 @@
 //!     whose results are not live.
 //! 11. **Clean up Nops** created by dead-def removal.
 //!
-//! After convergence, [`SsaFunction::compact_variables`] is called.
+//! Each mutating step runs through the checked SSA editor and performs
+//! boundary repair before the next analysis step.
 //!
 //! # Global DCE ([`run_global`])
 //!
@@ -45,8 +46,7 @@ use crate::{
     events::{EventKind, EventListener},
     graph::{algorithms, NodeId},
     ir::{
-        function::SsaFunction,
-        instruction::SsaInstruction,
+        function::{SsaEditOptions, SsaFunction},
         ops::SsaOp,
         phi::PhiNode,
         variable::{SsaVarId, VariableOrigin},
@@ -87,8 +87,8 @@ pub fn find_dead_tails<T: Target>(ssa: &SsaFunction<T>) -> Vec<(usize, usize)> {
 /// Run per-method dead code elimination on `ssa`.
 ///
 /// Iterates the multi-step DCE algorithm (reachability, liveness, dead
-/// removal) until convergence. After convergence, the variable table is
-/// compacted via [`SsaFunction::compact_variables`].
+/// removal) until convergence. Each checked edit boundary performs the
+/// required SSA repair before the next analysis step.
 ///
 /// # Arguments
 ///
@@ -117,9 +117,6 @@ where
             break;
         }
         changed = true;
-    }
-    if changed {
-        ssa.compact_variables();
     }
     changed
 }
@@ -164,7 +161,12 @@ where
         total_changes.saturating_add(remove_nop_instructions(ssa, &reachable, method, events));
 
     // Step 5: prune phi operands from unreachable predecessors.
-    total_changes = total_changes.saturating_add(ssa.prune_phi_operands(&reachable));
+    let mut pruned = 0usize;
+    let _ = ssa.edit(SsaEditOptions::new(), |editor| {
+        pruned = editor.prune_phi_operands(&reachable);
+        Ok(())
+    });
+    total_changes = total_changes.saturating_add(pruned);
     let reachable_set: BTreeSet<usize> = reachable.iter().collect();
 
     // Step 6: simplify trivial phis (purely structural).
@@ -172,11 +174,12 @@ where
     total_changes =
         total_changes.saturating_add(simplify_trivial_phis(ssa, &trivial_phis, method, events));
 
-    // Step 7: recompute reachability after phi simplification.
-    let reachable = find_reachable_blocks(ssa);
-
-    // Step 8: liveness via reverse dataflow.
-    let rpo = compute_reverse_postorder(ssa, &reachable);
+    // Step 7+8: recompute reachability after phi simplification, then compute
+    // liveness. Steps 1-6 do not modify any terminator, so a single CFG built
+    // here serves both the reachability sweep and the RPO traversal.
+    let cfg = SsaCfg::from_ssa(ssa);
+    let reachable = find_reachable_blocks_with_cfg(ssa, &cfg);
+    let rpo = compute_reverse_postorder(ssa, &reachable, &cfg);
     let live = compute_live_variables(ssa, &reachable, &rpo);
 
     // Step 9: remove dead phis.
@@ -200,19 +203,6 @@ where
     remove_instructions(ssa, &dead_defs, method, events);
     total_changes = total_changes.saturating_add(c10);
 
-    // Step 10b: clean up Nops created above (preserve indices in step 10
-    // but don't let them oscillate with op-less detection on the next
-    // iteration).
-    if c10 > 0 {
-        for block_idx in reachable.iter() {
-            if let Some(block) = ssa.block_mut(block_idx) {
-                block
-                    .instructions_mut()
-                    .retain(|instr| !matches!(instr.op(), SsaOp::Nop));
-            }
-        }
-    }
-
     total_changes
 }
 
@@ -220,11 +210,19 @@ fn find_reachable_blocks<T: Target>(ssa: &SsaFunction<T>) -> BitSet {
     if ssa.block_count() == 0 {
         return BitSet::new(0);
     }
-
     let cfg = SsaCfg::from_ssa(ssa);
+    find_reachable_blocks_with_cfg(ssa, &cfg)
+}
+
+/// Reachability using a prebuilt CFG, so callers that already have one (and
+/// that have not changed any terminator) avoid rebuilding it.
+fn find_reachable_blocks_with_cfg<T: Target>(ssa: &SsaFunction<T>, cfg: &SsaCfg<T>) -> BitSet {
+    if ssa.block_count() == 0 {
+        return BitSet::new(0);
+    }
 
     let mut reachable = BitSet::new(ssa.block_count());
-    for n in algorithms::bfs(&cfg, NodeId::new(0)) {
+    for n in algorithms::bfs(cfg, NodeId::new(0)) {
         let n: NodeId = n;
         reachable.insert(n.index());
     }
@@ -256,7 +254,7 @@ fn find_reachable_blocks<T: Target>(ssa: &SsaFunction<T>) -> BitSet {
     }
 
     for root in exception_roots.iter() {
-        for node in algorithms::bfs(&cfg, NodeId::new(root)) {
+        for node in algorithms::bfs(cfg, NodeId::new(root)) {
             let node: NodeId = node;
             reachable.insert(node.index());
         }
@@ -265,14 +263,16 @@ fn find_reachable_blocks<T: Target>(ssa: &SsaFunction<T>) -> BitSet {
     reachable
 }
 
-fn compute_reverse_postorder<T: Target>(ssa: &SsaFunction<T>, reachable: &BitSet) -> Vec<usize> {
+fn compute_reverse_postorder<T: Target>(
+    ssa: &SsaFunction<T>,
+    reachable: &BitSet,
+    cfg: &SsaCfg<T>,
+) -> Vec<usize> {
     if ssa.block_count() == 0 || reachable.is_empty() {
         return Vec::new();
     }
 
-    let cfg = SsaCfg::from_ssa(ssa);
-
-    let mut rpo: Vec<usize> = algorithms::reverse_postorder(&cfg, NodeId::new(0))
+    let mut rpo: Vec<usize> = algorithms::reverse_postorder(cfg, NodeId::new(0))
         .into_iter()
         .map(|n: NodeId| n.index())
         .filter(|idx| reachable.contains(*idx))
@@ -289,12 +289,15 @@ fn compute_reverse_postorder<T: Target>(ssa: &SsaFunction<T>, reachable: &BitSet
     additional.sort_unstable();
 
     for &root in &additional {
-        let handler_rpo: Vec<usize> = algorithms::reverse_postorder(&cfg, NodeId::new(root))
-            .into_iter()
-            .map(|n: NodeId| n.index())
-            .filter(|idx| reachable.contains(*idx) && !rpo.contains(idx))
-            .collect();
-        rpo.extend(handler_rpo);
+        // Maintain `in_rpo` incrementally so membership is O(1); a linear
+        // `rpo.contains` here would make the handler sweep O(blocks^2).
+        for node in algorithms::reverse_postorder(cfg, NodeId::new(root)) {
+            let idx = node.index();
+            if reachable.contains(idx) && !in_rpo.contains(idx) {
+                in_rpo.insert(idx);
+                rpo.push(idx);
+            }
+        }
     }
 
     rpo
@@ -316,12 +319,12 @@ fn compute_live_variables<T: Target>(
         if let Some(block) = ssa.block(block_idx) {
             for instr in block.instructions() {
                 let op = instr.op();
-                if !op.is_pure() {
-                    for var in op.uses() {
+                if !op.effects().is_pure() {
+                    op.for_each_use(|var| {
                         if live.insert(var.index()) {
                             worklist.push_back(var);
                         }
-                    }
+                    });
                 }
                 if let SsaOp::Return { value: Some(v) } = op {
                     if live.insert(v.index()) {
@@ -364,10 +367,11 @@ fn compute_live_variables<T: Target>(
 
             for instr in block.instructions() {
                 let op = instr.op();
-                if let Some(def) = op.dest() {
-                    for use_var in op.uses() {
+                let defs: Vec<SsaVarId> = op.defs().collect();
+                for &def in &defs {
+                    op.for_each_use(|use_var| {
                         def_uses.entry(def).or_default().push(use_var);
-                    }
+                    });
                     if let Some(var) = ssa.variable(def) {
                         let origin = var.origin();
                         if matches!(
@@ -453,19 +457,19 @@ fn find_dead_definitions<T: Target>(
         if let Some(block) = ssa.block(block_idx) {
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
                 let op = instr.op();
-                if !op.is_pure() {
+                if !op.effects().removable_when_unused() {
                     continue;
                 }
                 if matches!(op, SsaOp::Pop { .. }) {
                     continue;
                 }
-                match op.dest() {
-                    None => dead.push((block_idx, instr_idx)),
-                    Some(def) => {
-                        if !live.contains(def.index()) {
-                            dead.push((block_idx, instr_idx));
-                            dead_vars.insert(def.index());
-                        }
+                let defs: Vec<SsaVarId> = op.defs().collect();
+                if defs.is_empty() {
+                    dead.push((block_idx, instr_idx));
+                } else if defs.iter().all(|def| !live.contains(def.index())) {
+                    dead.push((block_idx, instr_idx));
+                    for def in defs {
+                        dead_vars.insert(def.index());
                     }
                 }
             }
@@ -522,31 +526,38 @@ fn remove_instructions<T, L>(
         by_block.entry(block_idx).or_default().push(instr_idx);
     }
 
-    for (block_idx, mut indices) in by_block {
-        indices.sort_by(|a, b| b.cmp(a));
-        if let Some(block) = ssa.block_mut(block_idx) {
+    let _ = ssa.edit(SsaEditOptions::new(), |editor| {
+        for (block_idx, mut indices) in by_block {
+            indices.sort_by(|a, b| b.cmp(a));
             for instr_idx in indices {
-                if instr_idx < block.instructions().len() {
-                    if let Some(instr) = block.instructions_mut().get_mut(instr_idx) {
-                        let message = if let Some(dest) = instr.op().dest() {
-                            format!("dead definition {dest}")
-                        } else {
-                            format!("dead {}", instr.mnemonic())
-                        };
-                        instr.set_op(SsaOp::Nop);
-                        let location = block_idx.saturating_mul(1000).saturating_add(instr_idx);
-                        push_event(
-                            events,
-                            EventKind::InstructionRemoved,
-                            method,
-                            Some(location),
-                            message,
-                        );
-                    }
-                }
+                let Some(instr) = editor
+                    .function()
+                    .block(block_idx)
+                    .and_then(|block| block.instructions().get(instr_idx))
+                else {
+                    continue;
+                };
+
+                let defs: Vec<SsaVarId> = instr.op().defs().collect();
+                let message = if defs.is_empty() {
+                    format!("dead {}", instr.mnemonic())
+                } else {
+                    format!("dead definition(s) {defs:?}")
+                };
+
+                editor.nop_instruction(block_idx, instr_idx)?;
+                let location = block_idx.saturating_mul(1000).saturating_add(instr_idx);
+                push_event(
+                    events,
+                    EventKind::InstructionRemoved,
+                    method,
+                    Some(location),
+                    message,
+                );
             }
         }
-    }
+        Ok(())
+    });
 }
 
 fn remove_phis<T, L>(
@@ -562,12 +573,12 @@ fn remove_phis<T, L>(
     for &(block_idx, phi_idx) in dead_phis {
         by_block.entry(block_idx).or_default().push(phi_idx);
     }
-    for (block_idx, mut indices) in by_block {
-        indices.sort_by(|a, b| b.cmp(a));
-        if let Some(block) = ssa.block_mut(block_idx) {
+
+    let _ = ssa.edit(SsaEditOptions::new(), |editor| {
+        for (block_idx, mut indices) in by_block {
+            indices.sort_by(|a, b| b.cmp(a));
             for phi_idx in indices {
-                if phi_idx < block.phi_nodes().len() {
-                    block.phi_nodes_mut().remove(phi_idx);
+                if editor.remove_phi(block_idx, phi_idx).is_ok() {
                     push_event(
                         events,
                         EventKind::PhiSimplified,
@@ -578,7 +589,8 @@ fn remove_phis<T, L>(
                 }
             }
         }
-    }
+        Ok(())
+    });
 }
 
 fn simplify_trivial_phis<T, L>(
@@ -601,32 +613,38 @@ where
             .push((phi_idx, replacement));
     }
 
-    for (block_idx, mut phis) in by_block {
-        phis.sort_by_key(|p| std::cmp::Reverse(p.0));
-        for (phi_idx, replacement) in phis {
-            if let Some(replacement_var) = replacement {
-                if ssa.simplify_phi_to_copy(block_idx, phi_idx, replacement_var) {
+    let _ = ssa.edit(SsaEditOptions::new(), |editor| {
+        for (block_idx, mut phis) in by_block {
+            phis.sort_by_key(|p| std::cmp::Reverse(p.0));
+            for (phi_idx, replacement) in phis {
+                if let Some(replacement_var) = replacement {
+                    if editor
+                        .simplify_phi_to_copy(block_idx, phi_idx, replacement_var)
+                        .is_ok()
+                    {
+                        push_event(
+                            events,
+                            EventKind::PhiSimplified,
+                            method,
+                            Some(block_idx),
+                            format!("replaced with {replacement_var}"),
+                        );
+                        simplified = simplified.saturating_add(1);
+                    }
+                } else if editor.remove_phi(block_idx, phi_idx).is_ok() {
                     push_event(
                         events,
                         EventKind::PhiSimplified,
                         method,
                         Some(block_idx),
-                        format!("replaced with {replacement_var}"),
+                        "removed self-referential phi".to_string(),
                     );
                     simplified = simplified.saturating_add(1);
                 }
-            } else if ssa.remove_phi_unchecked(block_idx, phi_idx) {
-                push_event(
-                    events,
-                    EventKind::PhiSimplified,
-                    method,
-                    Some(block_idx),
-                    "removed self-referential phi".to_string(),
-                );
-                simplified = simplified.saturating_add(1);
             }
         }
-    }
+        Ok(())
+    });
 
     simplified
 }
@@ -643,23 +661,21 @@ where
 {
     let mut cleared: usize = 0;
     let total_blocks = ssa.block_count();
-    for block_idx in 0..total_blocks {
-        if !reachable.contains(block_idx) {
-            if let Some(block) = ssa.block_mut(block_idx) {
-                if !block.is_empty() {
-                    block.clear();
-                    push_event(
-                        events,
-                        EventKind::BlockRemoved,
-                        method,
-                        Some(block_idx),
-                        format!("removed unreachable block {block_idx}"),
-                    );
-                    cleared = cleared.saturating_add(1);
-                }
+    let _ = ssa.edit(SsaEditOptions::new(), |editor| {
+        for block_idx in 0..total_blocks {
+            if !reachable.contains(block_idx) && editor.clear_block(block_idx).unwrap_or(false) {
+                push_event(
+                    events,
+                    EventKind::BlockRemoved,
+                    method,
+                    Some(block_idx),
+                    format!("removed unreachable block {block_idx}"),
+                );
+                cleared = cleared.saturating_add(1);
             }
         }
-    }
+        Ok(())
+    });
     cleared
 }
 
@@ -700,17 +716,17 @@ where
         by_block.entry(block_idx).or_default().push(instr_idx);
     }
     let mut removed: usize = 0;
-    for (block_idx, mut indices) in by_block {
-        indices.sort_by(|a, b| b.cmp(a));
-        if let Some(block) = ssa.block_mut(block_idx) {
+    let _ = ssa.edit(SsaEditOptions::new(), |editor| {
+        for (block_idx, mut indices) in by_block {
+            indices.sort_by(|a, b| b.cmp(a));
             for instr_idx in indices {
-                if instr_idx < block.instructions().len() {
-                    let mnemonic = block
-                        .instructions()
-                        .get(instr_idx)
-                        .map_or("unknown", SsaInstruction::mnemonic);
-                    let mnemonic_owned = mnemonic.to_string();
-                    block.instructions_mut().remove(instr_idx);
+                if let Some(instr) = editor
+                    .function()
+                    .block(block_idx)
+                    .and_then(|block| block.instructions().get(instr_idx))
+                {
+                    let mnemonic_owned = instr.mnemonic().to_string();
+                    editor.nop_instruction(block_idx, instr_idx)?;
                     let location = block_idx.saturating_mul(1000).saturating_add(instr_idx);
                     push_event(
                         events,
@@ -723,7 +739,8 @@ where
                 }
             }
         }
-    }
+        Ok(())
+    });
     removed
 }
 
@@ -737,27 +754,48 @@ where
     T: Target,
     L: EventListener<T> + ?Sized,
 {
-    let mut removed: usize = 0;
+    let mut nops = Vec::new();
     for block_idx in reachable.iter() {
-        if let Some(block) = ssa.block_mut(block_idx) {
-            let original_len = block.instructions().len();
-            block
-                .instructions_mut()
-                .retain(|instr| !matches!(instr.op(), SsaOp::Nop));
-            let new_len = block.instructions().len();
-            let nops_removed = original_len.saturating_sub(new_len);
-            if nops_removed > 0 {
-                push_event(
-                    events,
-                    EventKind::InstructionRemoved,
-                    method,
-                    Some(block_idx),
-                    format!("removed {nops_removed} Nop instructions"),
-                );
-                removed = removed.saturating_add(nops_removed);
+        if let Some(block) = ssa.block(block_idx) {
+            for (instr_idx, instr) in block.instructions().iter().enumerate() {
+                if matches!(instr.op(), SsaOp::Nop) {
+                    nops.push((block_idx, instr_idx));
+                }
             }
         }
     }
+
+    if nops.is_empty() {
+        return 0;
+    }
+
+    let mut removed = 0usize;
+    let _ = ssa.edit(SsaEditOptions::new(), |editor| {
+        for (block_idx, instr_idx) in &nops {
+            if editor.nop_instruction(*block_idx, *instr_idx).is_ok() {
+                removed = removed.saturating_add(1);
+            }
+        }
+        Ok(())
+    });
+
+    if removed > 0 {
+        let mut per_block: BTreeMap<usize, usize> = BTreeMap::new();
+        for (block_idx, _) in nops {
+            let entry = per_block.entry(block_idx).or_insert(0);
+            *entry = entry.saturating_add(1);
+        }
+        for (block_idx, count) in per_block {
+            push_event(
+                events,
+                EventKind::InstructionRemoved,
+                method,
+                Some(block_idx),
+                format!("removed {count} Nop instructions"),
+            );
+        }
+    }
+
     removed
 }
 
@@ -844,7 +882,10 @@ mod tests {
             value::ConstValue,
             variable::{DefSite, VariableOrigin},
         },
-        testing::{MockTarget, MockType, MockWorld},
+        testing::{
+            assert_mock_valid_full, run_mock_malformed_cleanup_boundary, run_mock_pass_boundary,
+            MockTarget, MockType, MockWorld,
+        },
     };
 
     #[test]
@@ -957,7 +998,8 @@ mod tests {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 20);
+        let changed =
+            run_mock_pass_boundary(&mut ssa, "empty DCE", |ssa| run(ssa, &method, &log, 20));
         assert!(!changed);
     }
 
@@ -977,9 +1019,17 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let _ = run(&mut ssa, &method, &log, 20);
+        let changed =
+            run_mock_malformed_cleanup_boundary(&mut ssa, "self-referential phi DCE", |ssa| {
+                run(ssa, &method, &log, 20)
+            });
+        assert!(changed, "self-referential phi should be removed");
         // The trivial phi should have been removed.
-        assert!(ssa.block(0).unwrap().phi_nodes().is_empty());
+        assert!(ssa
+            .block(0)
+            .expect("entry block should remain")
+            .phi_nodes()
+            .is_empty());
     }
 
     #[test]
@@ -1019,7 +1069,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 20);
+        let changed = run_mock_pass_boundary(&mut ssa, "unreachable-block DCE", |ssa| {
+            run(ssa, &method, &log, 20)
+        });
         assert!(changed, "unreachable block should be removed");
         assert!(log.has(EventKind::BlockRemoved));
     }
@@ -1059,7 +1111,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 20);
+        let changed = run_mock_pass_boundary(&mut ssa, "unused pure instruction DCE", |ssa| {
+            run(ssa, &method, &log, 20)
+        });
         assert!(changed, "unused pure instruction should be removed");
         assert!(log.has(EventKind::InstructionRemoved));
     }
@@ -1102,7 +1156,6 @@ mod tests {
 
         let mut b2 = SsaBlock::new(2);
         let mut phi = PhiNode::new(phi_var, VariableOrigin::Local(2));
-        phi.add_operand(PhiOperand::new(v0, 0));
         phi.add_operand(PhiOperand::new(v1, 1));
         b2.add_phi(phi);
         b2.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v0) }));
@@ -1111,7 +1164,8 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 20);
+        let changed =
+            run_mock_pass_boundary(&mut ssa, "dead phi DCE", |ssa| run(ssa, &method, &log, 20));
         // phi_var is never used after the phi, so the phi should be removed
         assert!(changed);
         assert!(log.has(EventKind::PhiSimplified));
@@ -1129,11 +1183,18 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 20);
+        let changed =
+            run_mock_pass_boundary(&mut ssa, "nop DCE", |ssa| run(ssa, &method, &log, 20));
         assert!(changed, "Nop instructions should be removed");
         assert!(log.has(EventKind::InstructionRemoved));
         // Only the Return should remain
-        assert_eq!(ssa.block(0).unwrap().instructions().len(), 1);
+        assert_eq!(
+            ssa.block(0)
+                .expect("entry block should remain")
+                .instructions()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1153,6 +1214,13 @@ mod tests {
             DefSite::instruction(0, 1),
             MockType::I32,
         );
+        let v2 = SsaVarId::from_index(2);
+        ssa.create_variable(
+            VariableOrigin::Local(2),
+            0,
+            DefSite::instruction(0, 2),
+            MockType::I32,
+        );
 
         let mut b0 = SsaBlock::new(0);
         b0.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
@@ -1165,7 +1233,7 @@ mod tests {
         }));
         // Use an overflow-checked arithmetic op (impure — may throw)
         b0.add_instruction(SsaInstruction::synthetic(SsaOp::AddOvf {
-            dest: SsaVarId::from_index(2),
+            dest: v2,
             left: v0,
             right: v1,
             unsigned: false,
@@ -1178,7 +1246,10 @@ mod tests {
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
         // We don't expect specific changes; just verify the function stays valid
-        let _ = run(&mut ssa, &method, &log, 20);
+        let changed = run_mock_pass_boundary(&mut ssa, "side-effect DCE", |ssa| {
+            run(ssa, &method, &log, 20)
+        });
+        assert!(!changed, "side-effecting unused instruction must remain");
     }
 
     #[test]
@@ -1226,9 +1297,11 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 20);
+        let changed = run_mock_pass_boundary(&mut ssa, "reachable-block DCE", |ssa| {
+            run(ssa, &method, &log, 20)
+        });
         // v1 is used, both blocks reachable — no dead code
-        let _ = changed;
+        assert!(!changed, "reachable live blocks should not be removed");
     }
 
     #[test]
@@ -1240,7 +1313,9 @@ mod tests {
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
+        assert_mock_valid_full(&ssa, "DCE iteration no-work before");
         let count = run_iteration(&mut ssa, &0u32, &log);
+        assert_mock_valid_full(&ssa, "DCE iteration no-work after");
         assert_eq!(count, 0);
     }
 
@@ -1277,7 +1352,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 20);
+        let changed = run_mock_pass_boundary(&mut ssa, "variable compaction DCE", |ssa| {
+            run(ssa, &method, &log, 20)
+        });
         assert!(changed);
         // v1 should be gone after compaction
         assert!(log.has(EventKind::InstructionRemoved));

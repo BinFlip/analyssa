@@ -17,7 +17,7 @@
 //!    This is the primary representation for analysis and optimization passes.
 //!
 //! This dual representation enables:
-//! - Direct def-use chain construction from `SsaOp::dest()` / `SsaOp::uses()`
+//! - Direct def-use chain construction from `SsaOp::defs()` / `SsaOp::uses()`
 //! - Dead code elimination (variable with no uses)
 //! - Pattern matching on decomposed operations for optimization
 //! - Faithful code generation from the original instruction where needed
@@ -67,7 +67,7 @@ pub struct SsaInstruction<T: Target> {
     ///
     /// This is the authoritative representation used by all analysis and
     /// optimization passes. All data dependencies are explicit in the
-    /// operation's `dest()` and `uses()`.
+    /// operation's `defs()` and `uses()`.
     op: SsaOp<T>,
 
     /// Optional resolved result type captured during SSA construction.
@@ -183,22 +183,45 @@ impl<T: Target> SsaInstruction<T> {
         self.op.uses()
     }
 
+    /// Calls `f` for every SSA variable used by this instruction.
+    pub fn for_each_use<F>(&self, f: F)
+    where
+        F: FnMut(SsaVarId),
+    {
+        self.op.for_each_use(f);
+    }
+
+    /// Returns `true` if this instruction uses (reads) the given variable.
+    ///
+    /// Allocation-free; prefer over `self.uses().contains(&var)` in hot paths.
+    #[must_use]
+    pub fn uses_var(&self, var: SsaVarId) -> bool {
+        self.op.uses_var(var)
+    }
+
     /// Returns the SSA variable defined by this instruction, if any.
     #[must_use]
     pub fn def(&self) -> Option<SsaVarId> {
         self.op.dest()
     }
 
+    /// Returns all SSA variables defined by this instruction.
+    pub fn defs(&self) -> impl Iterator<Item = SsaVarId> + '_ {
+        self.op.defs()
+    }
+
     /// Returns `true` if this instruction defines a value.
     #[must_use]
     pub fn has_def(&self) -> bool {
-        self.op.dest().is_some()
+        self.op.defs().next().is_some()
     }
 
     /// Returns `true` if this instruction has no uses.
     #[must_use]
     pub fn has_no_uses(&self) -> bool {
-        self.op.uses().is_empty()
+        let mut has_use = false;
+        self.op.for_each_use(|_| has_use = true);
+        !has_use
     }
 
     /// Returns all SSA variables referenced by this instruction.
@@ -206,11 +229,22 @@ impl<T: Target> SsaInstruction<T> {
     /// This includes both uses and the def (if present).
     #[must_use]
     pub fn all_variables(&self) -> Vec<SsaVarId> {
-        let mut vars = self.op.uses();
-        if let Some(def) = self.op.dest() {
-            vars.push(def);
-        }
+        let mut vars = Vec::new();
+        self.op.for_each_use(|var| vars.push(var));
+        vars.extend(self.op.defs());
         vars
+    }
+
+    /// Calls `f` for every SSA variable referenced (used or defined) by this
+    /// instruction, without allocating.
+    pub fn for_each_variable<F>(&self, mut f: F)
+    where
+        F: FnMut(SsaVarId),
+    {
+        self.op.for_each_use(&mut f);
+        for def in self.op.defs() {
+            f(def);
+        }
     }
 }
 

@@ -37,4 +37,4 @@ mod scheduler;
 
 pub use capability::DeobfuscationCapability;
 pub use pass::{ModificationScope, SsaPass, SsaPassHost};
-pub use scheduler::PassScheduler;
+pub use scheduler::{PassScheduler, PipelineConfig};

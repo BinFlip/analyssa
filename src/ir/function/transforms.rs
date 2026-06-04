@@ -42,10 +42,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
+    analysis::cfg::SsaCfg,
+    graph::{algorithms::compute_dominators, RootedGraph},
     ir::{
         block::ReplaceResult,
         function::SsaFunction,
         ops::SsaOp,
+        phi::PhiOperand,
         value::ConstValue,
         variable::{DefSite, SsaVarId, UseSite, VariableOrigin},
     },
@@ -158,7 +161,11 @@ impl<T: Target> SsaFunction<T> {
     ///
     /// # Usage
     ///
-    /// ```rust
+    /// This is a crate-internal method (used by the copy-propagation pass), so
+    /// the example is illustrative rather than executable from outside the
+    /// crate:
+    ///
+    /// ```rust,ignore
     /// use std::collections::BTreeMap;
     /// use analyssa::{ir::SsaVarId, testing};
     ///
@@ -169,7 +176,7 @@ impl<T: Target> SsaFunction<T> {
     /// let result = ssa.propagate_copies(&resolved_copies);
     /// assert_eq!(result.total_replaced, 0);
     /// ```
-    pub fn propagate_copies(
+    pub(in crate::ir::function) fn propagate_copies(
         &mut self,
         copies: &BTreeMap<SsaVarId, SsaVarId>,
     ) -> CopyPropagationResult {
@@ -178,12 +185,24 @@ impl<T: Target> SsaFunction<T> {
         let mut fully_propagated = BitSet::new(variable_count);
         let mut partially_propagated = BitSet::new(variable_count);
 
+        // Build the dominator tree once: rewriting instruction uses never
+        // changes any terminator, so it stays valid across every replacement
+        // below (previously each copy rebuilt the CFG + dominators).
+        let dominators = if self.block_count() > 0 {
+            let cfg = SsaCfg::from_ssa(self);
+            Some(compute_dominators(&cfg, cfg.entry()))
+        } else {
+            None
+        };
+
         for (dest, src) in copies {
             if dest == src {
                 continue;
             }
 
-            let result = self.replace_uses(*dest, *src);
+            let result = self
+                .replace_uses_checked_with(*dest, *src, dominators.as_ref())
+                .as_replace_result();
 
             if result.replaced > 0 {
                 if result.is_complete() {
@@ -209,17 +228,18 @@ impl<T: Target> SsaFunction<T> {
     /// whose destination has been fully propagated to all use sites. Without
     /// this, rebuild_ssa's rename would re-create versions for the Copy's origin,
     /// shadowing the source variable and undoing the propagation.
-    pub fn nop_copy_defining(&mut self, dest: SsaVarId) {
+    pub(in crate::ir::function) fn nop_copy_defining(&mut self, dest: SsaVarId) -> bool {
         for block in &mut self.blocks {
             for instr in block.instructions_mut() {
                 if let SsaOp::Copy { dest: d, .. } = instr.op() {
                     if *d == dest {
                         instr.set_op(SsaOp::Nop);
-                        return;
+                        return true;
                     }
                 }
             }
         }
+        false
     }
 
     /// Prunes phi operands from non-existent or unreachable predecessors.
@@ -245,7 +265,7 @@ impl<T: Target> SsaFunction<T> {
                     }
                 }
                 for instr in block.instructions() {
-                    if let Some(def) = instr.def() {
+                    for def in instr.defs() {
                         let idx = def.index();
                         if idx < variable_count {
                             defined_vars.insert(idx);
@@ -270,12 +290,12 @@ impl<T: Target> SsaFunction<T> {
         let mut actual_predecessors: BTreeMap<usize, BitSet> = BTreeMap::new();
         for block_idx in reachable.iter() {
             if let Some(block) = self.block(block_idx) {
-                for successor in block.successors() {
+                block.for_each_successor(|successor| {
                     actual_predecessors
                         .entry(successor)
                         .or_insert_with(|| BitSet::new(block_count))
                         .insert(block_idx);
-                }
+                });
             }
         }
 
@@ -293,27 +313,24 @@ impl<T: Target> SsaFunction<T> {
                         continue;
                     }
 
-                    let to_keep: Vec<bool> = operands
-                        .iter()
-                        .map(|op| {
-                            let pred = op.predecessor();
-                            let value = op.value();
-                            let pred_ok =
-                                pred < block_count && preds.is_some_and(|p| p.contains(pred));
-                            let val_ok = value.index() < variable_count
-                                && defined_vars.contains(value.index());
-                            pred_ok && val_ok
-                        })
-                        .collect();
+                    // Predicate for operands worth keeping; evaluated without
+                    // materializing a per-phi `Vec<bool>`.
+                    let keeps = |op: &PhiOperand| -> bool {
+                        let pred = op.predecessor();
+                        let value = op.value();
+                        let pred_ok = pred < block_count && preds.is_some_and(|p| p.contains(pred));
+                        let val_ok =
+                            value.index() < variable_count && defined_vars.contains(value.index());
+                        pred_ok && val_ok
+                    };
 
-                    // Never leave a PHI completely empty
-                    let keep_count = to_keep.iter().filter(|&&k| k).count();
+                    // Never leave a PHI completely empty.
+                    let keep_count = operands.iter().filter(|op| keeps(op)).count();
                     if keep_count == 0 {
                         continue;
                     }
 
-                    let mut keep_iter = to_keep.iter();
-                    operands.retain(|_| *keep_iter.next().unwrap_or(&true));
+                    operands.retain(|op| keeps(op));
 
                     pruned = pruned.saturating_add(original_len.saturating_sub(operands.len()));
                 }
@@ -328,8 +345,10 @@ impl<T: Target> SsaFunction<T> {
     /// This should be called after SSA transformations that may have invalidated
     /// the use tracking.
     pub fn recompute_uses(&mut self) {
+        let variables = &mut self.variables;
+
         // Step 1: Clear all existing uses
-        for var in &mut self.variables {
+        for var in variables.iter_mut() {
             var.clear_uses();
         }
 
@@ -337,24 +356,22 @@ impl<T: Target> SsaFunction<T> {
         for (block_idx, block) in self.blocks.iter().enumerate() {
             // Record uses from instructions
             for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                for use_var in instr.op().uses() {
-                    if let Some(var) = self.var_index(use_var) {
+                instr.op().for_each_use(|use_var| {
+                    let var = use_var.index();
+                    if let Some(slot) = variables.get_mut(var) {
                         let use_site = UseSite::instruction(block_idx, instr_idx);
-                        if let Some(slot) = self.variables.get_mut(var) {
-                            slot.add_use(use_site);
-                        }
+                        slot.add_use(use_site);
                     }
-                }
+                });
             }
 
             // Record uses from phi nodes
             for (phi_idx, phi) in block.phi_nodes().iter().enumerate() {
                 for operand in phi.operands() {
-                    if let Some(var) = self.var_index(operand.value()) {
+                    let var = operand.value().index();
+                    if let Some(slot) = variables.get_mut(var) {
                         let use_site = UseSite::phi_operand(block_idx, phi_idx);
-                        if let Some(slot) = self.variables.get_mut(var) {
-                            slot.add_use(use_site);
-                        }
+                        slot.add_use(use_site);
                     }
                 }
             }
@@ -377,22 +394,19 @@ impl<T: Target> SsaFunction<T> {
         false
     }
 
-    /// Removes an instruction by replacing it with a Nop.
-    pub fn remove_instruction(&mut self, block_idx: usize, instr_idx: usize) -> bool {
-        self.replace_instruction_op(block_idx, instr_idx, SsaOp::Nop)
-    }
-
     /// Simplifies a phi node by converting it to a copy operation.
     ///
     /// When a phi node has all identical operands (excluding self-references),
-    /// it can be converted to a simple copy operation: `phi_result = source`.
+    /// instruction uses of the phi result can be replaced with `source`. The
+    /// phi is removed only when no remaining use of its result exists outside
+    /// the phi being removed.
     pub fn simplify_phi_to_copy(
         &mut self,
         block_idx: usize,
         phi_idx: usize,
         source: SsaVarId,
     ) -> bool {
-        let Some(block) = self.blocks.get_mut(block_idx) else {
+        let Some(block) = self.blocks.get(block_idx) else {
             return false;
         };
 
@@ -402,11 +416,21 @@ impl<T: Target> SsaFunction<T> {
 
         let dest = phi.result();
 
-        // Remove the phi node
-        block.phi_nodes_mut().remove(phi_idx);
+        if dest != source {
+            let _ = self.replace_uses_checked(dest, source);
+        }
 
-        // Replace all uses of `dest` with `source`
-        self.replace_uses_including_phis(dest, source);
+        if has_remaining_uses_including_phis(self, dest, Some((block_idx, phi_idx))) {
+            return false;
+        }
+
+        let Some(block) = self.blocks.get_mut(block_idx) else {
+            return false;
+        };
+        if phi_idx >= block.phi_nodes().len() {
+            return false;
+        }
+        block.phi_nodes_mut().remove(phi_idx);
 
         true
     }
@@ -449,8 +473,11 @@ impl<T: Target> SsaFunction<T> {
         let mut total_eliminated: usize = 0;
         let block_count = self.blocks.len();
 
-        // Precompute reachability data if in reachable mode
+        // Precompute reachability data if in reachable mode. Build the full
+        // predecessor relation in one O(V+E) pass instead of calling
+        // `block_predecessors` per block (which is O(V) each → O(V²)).
         let reachable_preds: Option<BTreeMap<usize, BitSet>> = options.reachable.map(|reachable| {
+            let all_preds = self.compute_predecessors();
             let mut map = BTreeMap::new();
             for block in &self.blocks {
                 let block_idx = block.id();
@@ -458,9 +485,11 @@ impl<T: Target> SsaFunction<T> {
                     continue;
                 }
                 let mut preds = BitSet::new(block_count);
-                for p in self.block_predecessors(block_idx) {
-                    if reachable.contains(p) {
-                        preds.insert(p);
+                if let Some(plist) = all_preds.get(block_idx) {
+                    for &p in plist {
+                        if reachable.contains(p) {
+                            preds.insert(p);
+                        }
                     }
                 }
                 map.insert(block_idx, preds);
@@ -473,7 +502,7 @@ impl<T: Target> SsaFunction<T> {
             for block in &self.blocks {
                 let block_idx = block.id();
                 for instr in block.instructions() {
-                    if let Some(dest) = instr.op().dest() {
+                    for dest in instr.op().defs() {
                         map.insert(dest, block_idx);
                     }
                 }
@@ -591,15 +620,28 @@ impl<T: Target> SsaFunction<T> {
                     entry.1 = current;
                 }
 
-                // Replace uses and track which phis were fully propagated.
+                // Replace instruction uses through the checked path and only
+                // remove phis whose result is completely unused afterward. The
+                // dominator tree is built once for the whole batch — use
+                // replacement leaves the CFG (and therefore dominance) unchanged.
+                let dominators = if self.block_count() > 0 {
+                    let cfg = SsaCfg::from_ssa(self);
+                    Some(compute_dominators(&cfg, cfg.entry()))
+                } else {
+                    None
+                };
                 let mut trivial_set = BitSet::new(variable_count);
                 for (phi_result, source) in &trivial_phis {
                     if *phi_result != *source {
-                        let result = self.replace_uses_including_phis(*phi_result, *source);
-                        if result.is_complete() {
+                        let _ = self.replace_uses_checked_with(
+                            *phi_result,
+                            *source,
+                            dominators.as_ref(),
+                        );
+                        if !has_remaining_uses_including_phis(self, *phi_result, None) {
                             trivial_set.insert(phi_result.index());
                         }
-                    } else {
+                    } else if !has_remaining_uses_including_phis(self, *phi_result, None) {
                         trivial_set.insert(phi_result.index());
                     }
                 }
@@ -665,6 +707,46 @@ impl<T: Target> SsaFunction<T> {
         false
     }
 
+    pub(in crate::ir::function) fn refresh_def_sites(&mut self) {
+        let variable_count = self.var_id_capacity();
+        let mut active_defs = BitSet::new(variable_count);
+
+        for (block_idx, block) in self.blocks.iter().enumerate() {
+            for phi in block.phi_nodes() {
+                let result = phi.result();
+                let idx = result.index();
+                if idx < variable_count {
+                    active_defs.insert(idx);
+                    if let Some(var) = self.variables.get_mut(idx) {
+                        var.set_def_site(DefSite::phi(block_idx));
+                    }
+                }
+            }
+
+            for (instr_idx, instr) in block.instructions().iter().enumerate() {
+                if matches!(instr.op(), SsaOp::Nop) {
+                    continue;
+                }
+                for dest in instr.op().defs() {
+                    let idx = dest.index();
+                    if idx < variable_count {
+                        active_defs.insert(idx);
+                        if let Some(var) = self.variables.get_mut(idx) {
+                            var.set_def_site(DefSite::instruction(block_idx, instr_idx));
+                        }
+                    }
+                }
+            }
+        }
+
+        for var in &mut self.variables {
+            let idx = var.id().index();
+            if idx < variable_count && !active_defs.contains(idx) && var.def_site().block != 0 {
+                var.set_def_site(DefSite::entry());
+            }
+        }
+    }
+
     /// Compacts the variable table by removing orphaned variables.
     ///
     /// A variable is considered orphaned if:
@@ -674,7 +756,7 @@ impl<T: Target> SsaFunction<T> {
     /// # Returns
     ///
     /// The number of variables that were removed.
-    pub fn compact_variables(&mut self) -> usize {
+    pub(in crate::ir::function) fn compact_variables(&mut self) -> usize {
         let variable_count = self.var_id_capacity();
 
         // Phase 1: Collect all variables that still have active definitions
@@ -688,7 +770,7 @@ impl<T: Target> SsaFunction<T> {
                 if matches!(op, SsaOp::Nop) {
                     continue;
                 }
-                if let Some(dest) = op.dest() {
+                for dest in op.defs() {
                     let idx = dest.index();
                     if idx < variable_count {
                         defined_vars.insert(idx);
@@ -728,12 +810,12 @@ impl<T: Target> SsaFunction<T> {
                 if matches!(instr.op(), SsaOp::Nop) {
                     continue;
                 }
-                for u in instr.uses() {
+                instr.for_each_use(|u| {
                     let idx = u.index();
                     if idx < variable_count {
                         defined_vars.insert(idx);
                     }
-                }
+                });
             }
 
             // Also keep variables referenced by phi operands. A phi may
@@ -783,7 +865,7 @@ impl<T: Target> SsaFunction<T> {
     /// 1. Non-Nop instructions that shifted get their DefSites remapped
     /// 2. Variables whose defining instruction was a Nop get reset to entry DefSite
     /// 3. Any remaining out-of-bounds DefSites are reset to entry DefSite
-    pub fn strip_nops(&mut self) {
+    pub(in crate::ir::function) fn strip_nops(&mut self) {
         let mut remap: BTreeMap<(usize, usize), usize> = BTreeMap::new();
         let mut nop_sites: BTreeSet<(usize, usize)> = BTreeSet::new();
 
@@ -885,12 +967,12 @@ impl<T: Target> SsaFunction<T> {
         for block in &self.blocks {
             for instr in block.instructions() {
                 // Direct SSA uses
-                for u in instr.uses() {
+                instr.for_each_use(|u| {
                     let idx = u.index();
                     if idx < variable_count && all_phi_results.contains(idx) {
                         live_phis.insert(idx);
                     }
-                }
+                });
 
                 // Implicit uses via LoadLocal/LoadArg (index-based reads).
                 // These don't appear in uses() but create a dependency on
@@ -965,6 +1047,25 @@ impl<T: Target> SsaFunction<T> {
             idx >= variable_count || !dead_phis.contains(idx)
         });
     }
+}
+
+fn has_remaining_uses_including_phis<T: Target>(
+    ssa: &SsaFunction<T>,
+    var: SsaVarId,
+    skip_phi: Option<(usize, usize)>,
+) -> bool {
+    ssa.blocks().iter().any(|block| {
+        block.instructions().iter().any(|instr| {
+            let mut found = false;
+            instr.op().for_each_use(|used| found |= used == var);
+            found
+        }) || block
+            .phi_nodes()
+            .iter()
+            .enumerate()
+            .filter(|(phi_idx, _)| skip_phi != Some((block.id(), *phi_idx)))
+            .any(|(_, phi)| phi.operands().iter().any(|operand| operand.value() == var))
+    })
 }
 
 impl<T: Target> SsaFunction<T> {

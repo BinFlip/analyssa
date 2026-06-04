@@ -1,7 +1,5 @@
 //! Memory SSA and alias analysis tests.
 
-#![allow(clippy::unwrap_used)]
-
 use analyssa::{
     analysis::memory::{
         analyze_alias, AliasResult, ArrayIndex, MemoryLocation, MemorySsa, MemorySsaStats,
@@ -11,7 +9,7 @@ use analyssa::{
         block::SsaBlock,
         function::SsaFunction,
         instruction::SsaInstruction,
-        ops::SsaOp,
+        ops::{AtomicAccessWidth, AtomicOrdering, FenceKind, MemoryAccessSemantics, SsaOp},
         value::ConstValue,
         variable::{DefSite, SsaVarId, VariableOrigin},
     },
@@ -180,6 +178,49 @@ fn memory_ssa_new_is_empty() {
     assert_eq!(stats.load_count, 0);
     assert_eq!(stats.memory_phi_count, 0);
     assert_eq!(stats.version_count, 0);
+}
+
+#[test]
+fn memory_ssa_classifies_atomic_and_fence_effects() {
+    let mut ssa = SsaFunction::new(0, 1);
+    let addr = local(&mut ssa, 0, 0, 0);
+    let value = local(&mut ssa, 1, 0, 1);
+    let old = local(&mut ssa, 2, 0, 2);
+
+    let mut block = SsaBlock::new(0);
+    block.add_instruction(instr(SsaOp::Const {
+        dest: addr,
+        value: ConstValue::I32(0),
+    }));
+    block.add_instruction(instr(SsaOp::Const {
+        dest: value,
+        value: ConstValue::I32(1),
+    }));
+    block.add_instruction(instr(SsaOp::AtomicExchange {
+        dest: old,
+        addr,
+        value,
+        ordering: AtomicOrdering::AcqRel,
+        width: AtomicAccessWidth::Bits32,
+        volatile: true,
+    }));
+    block.add_instruction(instr(SsaOp::Fence {
+        kind: FenceKind::Acquire,
+    }));
+    block.add_instruction(instr(SsaOp::Return { value: Some(old) }));
+    ssa.add_block(block);
+    ssa.recompute_uses();
+
+    let cfg = SsaCfg::from_ssa(&ssa);
+    let mem_ssa = MemorySsa::<MockTarget>::build(&ssa, &cfg);
+    let stats = mem_ssa.stats();
+
+    assert_eq!(stats.store_count, 1);
+    assert_eq!(stats.barrier_count, 1);
+    assert!(mem_ssa.operations().iter().any(|op| {
+        op.effects()
+            .is_some_and(|effects| effects.memory_semantics == MemoryAccessSemantics::Atomic)
+    }));
 }
 
 #[test]

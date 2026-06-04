@@ -29,24 +29,78 @@
 //! cleared. Passes that declare `requires_full_scan()` bypass dirty
 //! tracking entirely.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Mutex,
+    },
+};
 
 use dashmap::DashSet;
 use log::debug;
 use rayon::prelude::*;
 
 use crate::{
+    analysis::verifier::{SsaVerifier, VerifyLevel},
     error::{Error, Result},
     events::EventKind,
     graph::IndexedGraph,
     ir::function::SsaFunction,
+    passes::{
+        AlgebraicSimplificationPass, BlockMergingPass, ControlFlowSimplificationPass,
+        CopyPropagationPass, DeadCodeEliminationPass, DeadMethodEliminationPass,
+        GlobalValueNumberingPass, JumpThreadingPass, LicmPass, LoopCanonicalizationPass,
+        OpaquePredicatePass, ReassociationPass, StrengthReductionPass, ValueRangePropagationPass,
+    },
     scheduling::pass::{ModificationScope, SsaPass, SsaPassHost},
     target::Target,
 };
 
 /// A registered pass paired with its assigned fallback layer number.
 type LayeredPass<T, H> = (Box<dyn SsaPass<T, H>>, usize);
+
+/// Built-in pass-pipeline configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipelineConfig {
+    /// Maximum iterations for the whole scheduler pipeline.
+    pub max_iterations: usize,
+    /// Number of stable outer iterations required before stopping.
+    pub stable_iterations: usize,
+    /// Maximum fixpoint iterations for one scheduler layer.
+    pub max_phase_iterations: usize,
+    /// Maximum fixpoint iterations for block merging.
+    pub block_merge_iterations: usize,
+    /// Maximum fixpoint iterations for control-flow simplification.
+    pub control_flow_iterations: usize,
+    /// Maximum fixpoint iterations for copy propagation.
+    pub copy_iterations: usize,
+    /// Maximum fixpoint iterations for dead-code elimination.
+    pub dead_code_iterations: usize,
+    /// Maximum fixpoint iterations for value-range propagation.
+    pub range_iterations: usize,
+    /// Include interprocedural dead-method elimination in scheduler presets.
+    pub include_dead_method_elimination: bool,
+    /// Verify each method after every pass and fail fast on invalid SSA.
+    pub verify_hard: bool,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            max_iterations: 10,
+            stable_iterations: 1,
+            max_phase_iterations: 10,
+            block_merge_iterations: 10,
+            control_flow_iterations: 10,
+            copy_iterations: 10,
+            dead_code_iterations: 50,
+            range_iterations: 20,
+            include_dead_method_elimination: true,
+            verify_hard: false,
+        }
+    }
+}
 
 /// Orchestrates SSA pass execution using capability-based scheduling.
 ///
@@ -74,6 +128,8 @@ where
     stable_iterations: usize,
     /// Maximum fixpoint iterations for a single layer before moving on.
     max_phase_iterations: usize,
+    /// Verify each method after every pass and return an error on invalid SSA.
+    verify_hard: bool,
     /// All non-normalize passes paired with their fallback layer number.
     passes: Vec<LayeredPass<T, H>>,
     /// Normalization passes. Run between every layer's fixpoint iterations.
@@ -90,30 +146,78 @@ where
     T::MethodRef: Send + Sync,
     H: SsaPassHost<T>,
 {
-    /// Create a new scheduler with the specified iteration limits.
+    /// Creates a scheduler that registers no built-in passes.
     ///
-    /// # Arguments
-    ///
-    /// * `max_iterations` — Maximum iterations for the entire pipeline
-    ///   before stopping regardless of convergence.
-    /// * `stable_iterations` — Stop early if no changes for this many
-    ///   consecutive global iterations.
-    /// * `max_phase_iterations` — Maximum fixpoint iterations for a
-    ///   single layer before moving to the next.
+    /// Only the iteration limits and `verify_hard` flag from `config` are
+    /// applied; the pass-tuning fields (e.g. `copy_iterations`,
+    /// `include_dead_method_elimination`) are ignored because no built-in
+    /// passes are added. Hosts that organize their own pipeline — adding
+    /// every pass explicitly via [`Self::add`], [`Self::add_at_layer`], or
+    /// [`Self::add_normalize`] — should start here instead of [`Self::new`]
+    /// to avoid running the default pipeline alongside their own passes.
     #[must_use]
-    pub fn new(
-        max_iterations: usize,
-        stable_iterations: usize,
-        max_phase_iterations: usize,
-    ) -> Self {
+    pub fn empty(config: PipelineConfig) -> Self {
         Self {
-            max_iterations,
-            stable_iterations,
-            max_phase_iterations,
+            max_iterations: config.max_iterations,
+            stable_iterations: config.stable_iterations,
+            max_phase_iterations: config.max_phase_iterations,
+            verify_hard: config.verify_hard,
             passes: Vec::new(),
             normalize: Vec::new(),
             _host: std::marker::PhantomData,
         }
+    }
+
+    /// Creates a scheduler from a pipeline configuration.
+    ///
+    /// The default configuration registers all built-in scheduler-backed
+    /// passes in a deterministic order. Value-cleanup passes are registered
+    /// as normalize passes so they run between layered fixpoint iterations.
+    /// Structural and value/enhancement passes are registered at their
+    /// conventional fallback layers. Interprocedural dead-method elimination
+    /// is included by default and can be disabled with
+    /// [`PipelineConfig::include_dead_method_elimination`].
+    ///
+    /// Hosts still provide storage and program context through
+    /// [`SsaPassHost`], [`crate::host::SsaStore`], [`crate::host::DirtySet`],
+    /// and [`crate::world::World`]; they do not need to hand-roll the pass
+    /// order. Hosts that supply their own complete pipeline should use
+    /// [`Self::empty`] instead.
+    #[must_use]
+    pub fn new(config: PipelineConfig) -> Self
+    where
+        T: Send + Sync,
+    {
+        let mut scheduler = Self::empty(config);
+
+        scheduler.add_normalize(Box::new(GlobalValueNumberingPass::new()));
+        scheduler.add_normalize(Box::new(CopyPropagationPass::new(config.copy_iterations)));
+        scheduler.add_normalize(Box::new(DeadCodeEliminationPass::new(
+            config.dead_code_iterations,
+        )));
+
+        if config.include_dead_method_elimination {
+            scheduler.add(Box::new(DeadMethodEliminationPass));
+        }
+
+        scheduler.add(Box::new(ControlFlowSimplificationPass::new(
+            config.control_flow_iterations,
+        )));
+        scheduler.add(Box::new(JumpThreadingPass::new()));
+        scheduler.add(Box::new(LoopCanonicalizationPass::new()));
+        scheduler.add(Box::new(BlockMergingPass::new(
+            config.block_merge_iterations,
+        )));
+        scheduler.add(Box::new(AlgebraicSimplificationPass::new()));
+        scheduler.add(Box::new(ReassociationPass::new()));
+        scheduler.add(Box::new(StrengthReductionPass));
+        scheduler.add(Box::new(ValueRangePropagationPass::new(
+            config.range_iterations,
+        )));
+        scheduler.add(Box::new(OpaquePredicatePass::<T>::new()));
+        scheduler.add(Box::new(LicmPass::new()));
+
+        scheduler
     }
 
     /// Returns the number of non-normalize (layered) passes registered.
@@ -225,11 +329,12 @@ where
         while changed {
             changed = false;
             for i in 0..n {
-                let dep_list = match deps.get(i) {
-                    Some(d) => d.clone(),
-                    None => continue,
+                // `deps` is read-only here and `layer` is a separate buffer, so
+                // no clone is needed to satisfy the borrow checker.
+                let Some(dep_list) = deps.get(i) else {
+                    continue;
                 };
-                for dep in dep_list {
+                for &dep in dep_list {
                     let layer_i = layer.get(i).copied().unwrap_or(0);
                     let layer_dep = layer.get(dep).copied().unwrap_or(0);
                     if layer_i <= layer_dep {
@@ -314,6 +419,7 @@ where
         let max_phase = self.max_phase_iterations;
         let max_iterations = self.max_iterations;
         let stable_iterations = self.stable_iterations;
+        let verify_hard = self.verify_hard;
 
         for iteration in 0..max_iterations {
             iterations = iteration.saturating_add(1);
@@ -330,6 +436,7 @@ where
                     &mut self.normalize,
                     max_phase,
                     &iteration_modified,
+                    verify_hard,
                 )? {
                     iteration_changed = true;
                 }
@@ -343,6 +450,7 @@ where
                     &mut self.normalize,
                     max_phase,
                     &iteration_modified,
+                    verify_hard,
                 )?;
             }
 
@@ -384,10 +492,11 @@ where
         passes: &mut [Box<dyn SsaPass<T, H>>],
         max_phase_iterations: usize,
         iteration_modified: &DashSet<T::MethodRef>,
+        verify_hard: bool,
     ) -> Result<bool> {
         let mut any_changed = false;
         for _ in 0..max_phase_iterations {
-            let changed = Self::run_passes_once(host, passes, iteration_modified)?;
+            let changed = Self::run_passes_once(host, passes, iteration_modified, verify_hard)?;
             if !changed {
                 break;
             }
@@ -405,6 +514,7 @@ where
         normalize_passes: &mut [Box<dyn SsaPass<T, H>>],
         max_phase_iterations: usize,
         iteration_modified: &DashSet<T::MethodRef>,
+        verify_hard: bool,
     ) -> Result<bool> {
         if layer_indices.is_empty() {
             return Ok(false);
@@ -413,8 +523,13 @@ where
         let mut phase_changed = false;
 
         for _ in 0..max_phase_iterations {
-            let pass_changed =
-                Self::run_layer_passes_once(host, all_passes, layer_indices, iteration_modified)?;
+            let pass_changed = Self::run_layer_passes_once(
+                host,
+                all_passes,
+                layer_indices,
+                iteration_modified,
+                verify_hard,
+            )?;
 
             if !pass_changed {
                 if phase_changed && !normalize_passes.is_empty() {
@@ -423,6 +538,7 @@ where
                         normalize_passes,
                         max_phase_iterations,
                         iteration_modified,
+                        verify_hard,
                     )?;
                 }
                 break;
@@ -436,6 +552,7 @@ where
                     normalize_passes,
                     max_phase_iterations,
                     iteration_modified,
+                    verify_hard,
                 )?;
             }
         }
@@ -448,6 +565,7 @@ where
         host: &H,
         passes: &mut [Box<dyn SsaPass<T, H>>],
         iteration_modified: &DashSet<T::MethodRef>,
+        verify_hard: bool,
     ) -> Result<bool> {
         for pass in passes.iter_mut() {
             pass.initialize(host)?;
@@ -478,7 +596,8 @@ where
                 methods,
                 &any_changed,
                 iteration_modified,
-            );
+                verify_hard,
+            )?;
         }
 
         for pass in passes.iter_mut() {
@@ -494,6 +613,7 @@ where
         all_passes: &mut [LayeredPass<T, H>],
         indices: &[usize],
         iteration_modified: &DashSet<T::MethodRef>,
+        verify_hard: bool,
     ) -> Result<bool> {
         for &idx in indices {
             let pass_entry = all_passes
@@ -535,7 +655,8 @@ where
                 methods,
                 &any_changed,
                 iteration_modified,
-            );
+                verify_hard,
+            )?;
         }
 
         for &idx in indices {
@@ -562,8 +683,10 @@ where
             topo
         };
 
-        let dirty_set: Option<Vec<T::MethodRef>> = if dirty_only {
-            Some(host.dirty_snapshot())
+        // Build the dirty set as a HashSet so membership is O(1); a `Vec`
+        // made the per-method filter below O(methods * dirty).
+        let dirty_set: Option<HashSet<T::MethodRef>> = if dirty_only {
+            Some(host.dirty_snapshot().into_iter().collect())
         } else {
             None
         };
@@ -586,9 +709,11 @@ where
         methods: &[T::MethodRef],
         any_changed: &AtomicBool,
         iteration_modified: &DashSet<T::MethodRef>,
-    ) {
+        verify_hard: bool,
+    ) -> Result<()> {
         let event_snapshot = host.events().len();
         let pass_change_count = AtomicUsize::new(0);
+        let errors = Mutex::new(Vec::<String>::new());
 
         // Passes that read other methods' SSA need peer SSAs to remain
         // visible during parallel execution. Clone the SSA before
@@ -612,24 +737,79 @@ where
                 ssa
             };
 
+            let original = if verify_hard { Some(ssa.clone()) } else { None };
             let result = pass.run_on_method(&mut ssa, method, host);
+            let changed = match result {
+                Ok(changed) => changed,
+                Err(error) => {
+                    if let Some(snapshot) = original {
+                        ssa = snapshot;
+                    }
+                    host.insert_ssa(method.clone(), ssa);
+                    if let Ok(mut guard) = errors.lock() {
+                        guard.push(format!(
+                            "pass '{}' failed for method {:?}: {}",
+                            pass.name(),
+                            method,
+                            error
+                        ));
+                    }
+                    return;
+                }
+            };
 
-            if let Ok(true) = result {
+            if changed && !pass.repairs_ssa() {
                 match pass.modification_scope() {
                     ModificationScope::UsesOnly | ModificationScope::InstructionsOnly => {
                         ssa.repair_ssa();
                     }
                     ModificationScope::CfgModifying => {
                         if let Err(e) = ssa.rebuild_ssa() {
-                            log::warn!("SSA rebuild failed for method: {}", e);
+                            if let Some(snapshot) = original {
+                                ssa = snapshot;
+                            }
+                            host.insert_ssa(method.clone(), ssa);
+                            if let Ok(mut guard) = errors.lock() {
+                                guard.push(format!(
+                                    "pass '{}' failed SSA rebuild for method {:?}: {}",
+                                    pass.name(),
+                                    method,
+                                    e
+                                ));
+                            }
+                            return;
                         }
                     }
                 }
             }
 
+            if verify_hard {
+                let verifier_errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
+                if !verifier_errors.is_empty() {
+                    if let Some(snapshot) = original {
+                        ssa = snapshot;
+                    }
+                    host.insert_ssa(method.clone(), ssa);
+                    let details = verifier_errors
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    if let Ok(mut guard) = errors.lock() {
+                        guard.push(format!(
+                            "pass '{}' produced invalid SSA for method {:?}: {}",
+                            pass.name(),
+                            method,
+                            details
+                        ));
+                    }
+                    return;
+                }
+            }
+
             host.insert_ssa(method.clone(), ssa);
 
-            if let Ok(true) = result {
+            if changed {
                 any_changed.store(true, Ordering::Relaxed);
                 pass_change_count.fetch_add(1, Ordering::Relaxed);
                 host.mark_processed(method);
@@ -637,25 +817,36 @@ where
             }
         });
 
-        let count = pass_change_count.load(Ordering::Relaxed);
-        if count > 0 {
-            let event_delta = host.events().count_by_kind_since(event_snapshot);
-            if event_delta.is_empty() {
-                debug!("  pass '{}' changed {} methods", pass.name(), count);
-            } else {
-                let summary = format_event_delta(&event_delta);
-                if summary.is_empty() {
+        let failures = errors
+            .into_inner()
+            .map_err(|_| Error::new("scheduler: failed to read pass errors"))?;
+        if let Some(first) = failures.first() {
+            return Err(Error::new(first.clone()));
+        }
+
+        if log::log_enabled!(log::Level::Debug) {
+            let count = pass_change_count.load(Ordering::Relaxed);
+            if count > 0 {
+                let event_delta = host.events().count_by_kind_since(event_snapshot);
+                if event_delta.is_empty() {
                     debug!("  pass '{}' changed {} methods", pass.name(), count);
                 } else {
-                    debug!(
-                        "  pass '{}' changed {} methods ({})",
-                        pass.name(),
-                        count,
-                        summary
-                    );
+                    let summary = format_event_delta(&event_delta);
+                    if summary.is_empty() {
+                        debug!("  pass '{}' changed {} methods", pass.name(), count);
+                    } else {
+                        debug!(
+                            "  pass '{}' changed {} methods ({})",
+                            pass.name(),
+                            count,
+                            summary
+                        );
+                    }
                 }
             }
         }
+
+        Ok(())
     }
 }
 

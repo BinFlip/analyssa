@@ -122,28 +122,27 @@ impl<'a, T: Target> SsaCfg<'a, T> {
         let mut predecessors = vec![Vec::new(); block_count];
 
         // Build successor/predecessor lists from block terminators
-        for (block_idx, block_succs_list) in successors.iter_mut().enumerate() {
-            if let Some(block) = ssa.block(block_idx) {
-                let block_succs = block
-                    .instructions()
-                    .iter()
-                    .rev()
-                    .find_map(|instr| {
-                        let op = instr.op();
-                        if op.is_terminator() {
-                            Some(op.successors())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default();
-
-                for succ in block_succs {
+        for block_idx in 0..block_count {
+            let Some(block) = ssa.block(block_idx) else {
+                continue;
+            };
+            let terminator = block.instructions().iter().rev().find_map(|instr| {
+                let op = instr.op();
+                if op.is_terminator() {
+                    Some(op)
+                } else {
+                    None
+                }
+            });
+            if let Some(op) = terminator {
+                op.for_each_successor(|succ| {
                     if let Some(slot) = predecessors.get_mut(succ) {
-                        block_succs_list.push(succ);
+                        if let Some(block_succs_list) = successors.get_mut(block_idx) {
+                            block_succs_list.push(succ);
+                        }
                         slot.push(block_idx);
                     }
-                }
+                });
             }
         }
 

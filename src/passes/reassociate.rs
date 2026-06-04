@@ -43,7 +43,12 @@ use std::collections::{BTreeMap, HashSet};
 use crate::{
     analysis::DefUseIndex,
     events::{EventKind, EventListener},
-    ir::{function::SsaFunction, ops::SsaOp, value::ConstValue, variable::SsaVarId},
+    ir::{
+        function::{SsaEditOptions, SsaFunction},
+        ops::SsaOp,
+        value::ConstValue,
+        variable::SsaVarId,
+    },
     pointer::PointerSize,
     target::Target,
 };
@@ -367,72 +372,105 @@ where
     let mut modified: HashSet<(usize, usize)> = HashSet::new();
     let mut changed = false;
 
-    for candidate in candidates {
-        // Skip if either position has already been rewritten by a prior
-        // overlapping candidate. This avoids ambiguous chain rewrites.
-        if modified.contains(&(candidate.inner_block, candidate.inner_instr))
-            || modified.contains(&(candidate.block_idx, candidate.instr_idx))
-        {
-            continue;
-        }
-
-        let Some(combined) =
-            candidate
-                .op_kind
-                .combine(&candidate.const1_value, &candidate.const2_value, ptr_size)
-        else {
-            continue;
-        };
-
-        if let Some(block) = ssa.block_mut(candidate.inner_block) {
-            for instr in block.instructions_mut() {
-                if let SsaOp::Const { dest, value: _ } = instr.op() {
-                    if *dest == candidate.const1_var {
-                        instr.set_op(SsaOp::Const {
-                            dest: *dest,
-                            value: combined.clone(),
-                        });
-                        break;
-                    }
-                }
+    let result = ssa.edit(SsaEditOptions::new(), |editor| {
+        for candidate in candidates {
+            // Skip if either position has already been rewritten by a prior
+            // overlapping candidate. This avoids ambiguous chain rewrites.
+            if modified.contains(&(candidate.inner_block, candidate.inner_instr))
+                || modified.contains(&(candidate.block_idx, candidate.instr_idx))
+            {
+                continue;
             }
-            if let Some(inner_instr) = block.instructions_mut().get_mut(candidate.inner_instr) {
-                inner_instr.set_op(make_op(
+
+            let Some(combined) = candidate.op_kind.combine(
+                &candidate.const1_value,
+                &candidate.const2_value,
+                ptr_size,
+            ) else {
+                continue;
+            };
+
+            let Some(const_instr_idx) =
+                editor
+                    .function()
+                    .block(candidate.inner_block)
+                    .and_then(|block| {
+                        block.instructions().iter().position(|instr| {
+                            matches!(
+                                instr.op(),
+                                SsaOp::Const { dest, .. } if *dest == candidate.const1_var
+                            )
+                        })
+                    })
+            else {
+                continue;
+            };
+
+            let inner_exists = editor
+                .function()
+                .block(candidate.inner_block)
+                .and_then(|block| block.instruction(candidate.inner_instr))
+                .is_some();
+            let outer_exists = editor
+                .function()
+                .block(candidate.block_idx)
+                .and_then(|block| block.instruction(candidate.instr_idx))
+                .is_some();
+            if !inner_exists || !outer_exists {
+                continue;
+            }
+
+            editor.replace_instruction_op(
+                candidate.inner_block,
+                const_instr_idx,
+                SsaOp::Const {
+                    dest: candidate.const1_var,
+                    value: combined.clone(),
+                },
+            )?;
+            editor.replace_instruction_op(
+                candidate.inner_block,
+                candidate.inner_instr,
+                make_op(
                     candidate.op_kind,
                     candidate.inner_dest,
                     candidate.base_var,
                     candidate.const1_var,
-                ));
-            }
-        }
-
-        if let Some(block) = ssa.block_mut(candidate.block_idx) {
-            if let Some(outer_instr) = block.instructions_mut().get_mut(candidate.instr_idx) {
-                outer_instr.set_op(SsaOp::Copy {
+                ),
+            )?;
+            editor.replace_instruction_op(
+                candidate.block_idx,
+                candidate.instr_idx,
+                SsaOp::Copy {
                     dest: candidate.dest,
                     src: candidate.inner_dest,
-                });
-            }
+                },
+            )?;
+
+            modified.insert((candidate.inner_block, candidate.inner_instr));
+            modified.insert((candidate.block_idx, candidate.instr_idx));
+
+            let event = crate::events::Event {
+                kind: EventKind::ConstantFolded,
+                method: Some(method.clone()),
+                location: Some(candidate.instr_idx),
+                message: format!(
+                    "reassociate: (x {} c1) {} c2 → x {} (c1 {} c2)",
+                    candidate.op_kind.name(),
+                    candidate.op_kind.name(),
+                    candidate.op_kind.name(),
+                    candidate.op_kind.combine_name()
+                ),
+                pass: None,
+            };
+            events.push(event);
+            changed = true;
         }
+        Ok(())
+    });
 
-        modified.insert((candidate.inner_block, candidate.inner_instr));
-        modified.insert((candidate.block_idx, candidate.instr_idx));
-
-        let event = crate::events::Event {
-            kind: EventKind::ConstantFolded,
-            method: Some(method.clone()),
-            location: Some(candidate.instr_idx),
-            message: format!(
-                "reassociate: (x {} c1) {} c2 → x {} (c1 {} c2)",
-                candidate.op_kind.name(),
-                candidate.op_kind.name(),
-                candidate.op_kind.name(),
-                candidate.op_kind.combine_name()
-            ),
-            pass: None,
-        };
-        events.push(event);
-        changed = true;
+    if result.is_err() {
+        return false;
     }
 
     changed
@@ -449,7 +487,7 @@ mod tests {
             value::ConstValue,
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
-        testing::{MockTarget, MockType},
+        testing::{run_mock_pass_boundary, MockTarget, MockType},
     };
 
     fn add(
@@ -599,6 +637,14 @@ mod tests {
         )
     }
 
+    fn run_reassociate(
+        ssa: &mut SsaFunction<MockTarget>,
+        label: &str,
+        log: &EventLog<MockTarget>,
+    ) -> bool {
+        run_mock_pass_boundary(ssa, label, |ssa| run(ssa, &0u32, log, PointerSize::Bit64))
+    }
+
     #[test]
     fn reassociate_add_combines_constants() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
@@ -639,7 +685,7 @@ mod tests {
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run(&mut ssa, &0u32, &log, PointerSize::Bit64);
+        let changed = run_reassociate(&mut ssa, "add reassociation", &log);
         assert!(changed, "constant add reassociation should fire");
         assert!(log.has(EventKind::ConstantFolded));
     }
@@ -684,7 +730,7 @@ mod tests {
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run(&mut ssa, &0u32, &log, PointerSize::Bit64);
+        let changed = run_reassociate(&mut ssa, "mul reassociation", &log);
         assert!(changed, "constant mul reassociation should fire");
     }
 
@@ -728,7 +774,7 @@ mod tests {
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run(&mut ssa, &0u32, &log, PointerSize::Bit64);
+        let changed = run_reassociate(&mut ssa, "and reassociation", &log);
         assert!(changed, "constant and reassociation should fire");
     }
 
@@ -772,7 +818,7 @@ mod tests {
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run(&mut ssa, &0u32, &log, PointerSize::Bit64);
+        let changed = run_reassociate(&mut ssa, "or reassociation", &log);
         assert!(changed, "constant or reassociation should fire");
     }
 
@@ -804,7 +850,7 @@ mod tests {
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run(&mut ssa, &0u32, &log, PointerSize::Bit64);
+        let changed = run_reassociate(&mut ssa, "no-candidate reassociation", &log);
         assert!(
             !changed,
             "no nested constant pattern should not trigger reassociation"
@@ -851,7 +897,7 @@ mod tests {
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run(&mut ssa, &0u32, &log, PointerSize::Bit64);
+        let changed = run_reassociate(&mut ssa, "commutative-left reassociation", &log);
         assert!(
             changed,
             "commutative reassociation with constant on left should fire"
@@ -898,7 +944,7 @@ mod tests {
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run(&mut ssa, &0u32, &log, PointerSize::Bit64);
+        let changed = run_reassociate(&mut ssa, "shift reassociation", &log);
         assert!(changed, "shift reassociation should fire");
     }
 
@@ -942,7 +988,7 @@ mod tests {
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run(&mut ssa, &0u32, &log, PointerSize::Bit64);
+        let changed = run_reassociate(&mut ssa, "sub reassociation", &log);
         assert!(changed, "sub reassociation should fire");
     }
 
@@ -950,7 +996,7 @@ mod tests {
     fn reassociate_empty_function() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
         let log: EventLog<MockTarget> = EventLog::new();
-        let changed = run(&mut ssa, &0u32, &log, PointerSize::Bit64);
+        let changed = run_reassociate(&mut ssa, "empty reassociation", &log);
         assert!(!changed);
     }
 }

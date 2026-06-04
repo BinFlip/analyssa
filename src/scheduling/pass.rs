@@ -218,6 +218,18 @@ pub trait SsaPass<T: Target, H: SsaPassHost<T>>: Send + Sync {
         ModificationScope::CfgModifying
     }
 
+    /// Returns whether the pass performs its own SSA boundary repair.
+    ///
+    /// Passes that wrap their mutation body in
+    /// [`SsaFunction::edit`](crate::ir::function::SsaFunction::edit) should
+    /// return `true` so the scheduler does not run a second repair step on
+    /// the same method. The pass must still report an accurate
+    /// [`modification_scope`](Self::modification_scope) for ordering,
+    /// documentation, and hosts that inspect pass metadata.
+    fn repairs_ssa(&self) -> bool {
+        false
+    }
+
     /// Returns the capabilities this pass provides after execution.
     ///
     /// The scheduler ensures that consumers of a capability are placed in

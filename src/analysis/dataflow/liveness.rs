@@ -105,16 +105,16 @@ impl LiveVariables {
             // Process instructions in forward order
             for instr in block.instructions() {
                 // Uses first (before def, since this is the "USE before DEF" set)
-                for &use_var in &instr.uses() {
+                instr.for_each_use(|use_var| {
                     if let Some(var_idx) = ssa.var_index(use_var) {
                         if !defs.contains(var_idx) {
                             uses.insert(var_idx);
                         }
                     }
-                }
+                });
 
                 // Then definition
-                if let Some(def) = instr.def() {
+                for def in instr.defs() {
                     if let Some(def_idx) = ssa.var_index(def) {
                         defs.insert(def_idx);
                     }
@@ -288,8 +288,8 @@ impl MeetSemiLattice for LivenessResult {
     }
 
     fn is_bottom(&self) -> bool {
-        // Bottom is when all variables are live (full set)
-        self.live.count() == self.live.len()
+        // Bottom is when all variables are live (full set).
+        self.live.is_full()
     }
 }
 

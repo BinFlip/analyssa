@@ -1,7 +1,5 @@
 //! Control-flow and block utility SSA patterns.
 
-#![allow(clippy::unwrap_used)]
-
 use analyssa::{
     analysis::{SsaCfg, SsaVerifier, VerifyLevel},
     ir::{
@@ -27,6 +25,10 @@ fn local(ssa: &mut SsaFunction<MockTarget>, idx: u16, block: usize, instr: usize
 
 fn instr(op: SsaOp<MockTarget>) -> SsaInstruction<MockTarget> {
     SsaInstruction::synthetic(op)
+}
+
+fn some_or_abort<T>(value: Option<T>) -> T {
+    value.unwrap_or_else(|| std::process::abort())
 }
 
 #[test]
@@ -148,10 +150,16 @@ fn block_utilities_detect_trampolines_and_reorder_local_dependencies() {
     block.add_instruction(instr(SsaOp::Return { value: Some(v2) }));
 
     assert!(block.sort_instructions_topologically());
-    assert!(matches!(block.instruction(0).unwrap().op(), SsaOp::Const { dest, .. } if *dest == v0));
-    assert!(matches!(block.instruction(1).unwrap().op(), SsaOp::Const { dest, .. } if *dest == v1));
-    assert!(matches!(block.instruction(2).unwrap().op(), SsaOp::Add { dest, .. } if *dest == v2));
-    assert!(block.instruction(3).unwrap().is_terminator());
+    assert!(
+        matches!(some_or_abort(block.instruction(0)).op(), SsaOp::Const { dest, .. } if *dest == v0)
+    );
+    assert!(
+        matches!(some_or_abort(block.instruction(1)).op(), SsaOp::Const { dest, .. } if *dest == v1)
+    );
+    assert!(
+        matches!(some_or_abort(block.instruction(2)).op(), SsaOp::Add { dest, .. } if *dest == v2)
+    );
+    assert!(some_or_abort(block.instruction(3)).is_terminator());
 }
 
 // ---------------------------------------------------------------------------
@@ -187,9 +195,7 @@ fn interrupt_handler_with_interrupt_return_terminator() {
 
     assert_eq!(ssa.kind(), FunctionKind::InterruptHandler);
     assert!(ssa.has_interrupt_return());
-    assert!(ssa
-        .block(0)
-        .unwrap()
+    assert!(some_or_abort(ssa.block(0))
         .terminator_op()
         .is_some_and(|op| { matches!(op, SsaOp::InterruptReturn) }));
 }

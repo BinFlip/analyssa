@@ -113,10 +113,12 @@ pub struct DirectedGraph<'a, N: Clone, E> {
     nodes: Cow<'a, [N]>,
     /// Edge data storage
     edges: Vec<EdgeData<E>>,
-    /// Outgoing edges per node (adjacency list for successors)
-    outgoing: Vec<Vec<EdgeId>>,
-    /// Incoming edges per node (adjacency list for predecessors)
-    incoming: Vec<Vec<EdgeId>>,
+    /// Outgoing adjacency per node: `(target node, edge id)` pairs. Storing the
+    /// target inline lets `successors` iterate without a second lookup into
+    /// `edges`.
+    outgoing: Vec<Vec<(NodeId, EdgeId)>>,
+    /// Incoming adjacency per node: `(source node, edge id)` pairs.
+    incoming: Vec<Vec<(NodeId, EdgeId)>>,
 }
 
 impl<N: Clone, E> Default for DirectedGraph<'static, N, E> {
@@ -489,7 +491,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
                     "outgoing adjacency missing for source node {source}"
                 ))
             })?
-            .push(id);
+            .push((target, id));
         self.incoming
             .get_mut(target.index())
             .ok_or_else(|| {
@@ -497,7 +499,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
                     "incoming adjacency missing for target node {target}"
                 ))
             })?
-            .push(id);
+            .push((source, id));
 
         Ok(id)
     }
@@ -654,7 +656,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
             .get(node.index())
             .into_iter()
             .flatten()
-            .filter_map(|&edge_id| self.edges.get(edge_id.index()).map(|e| e.target))
+            .map(|&(target, _)| target)
     }
 
     /// Returns an iterator over the predecessors of the given node.
@@ -694,7 +696,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
             .get(node.index())
             .into_iter()
             .flatten()
-            .filter_map(|&edge_id| self.edges.get(edge_id.index()).map(|e| e.source))
+            .map(|&(source, _)| source)
     }
 
     /// Returns an iterator over outgoing edges from the given node.
@@ -734,7 +736,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
             .get(node.index())
             .into_iter()
             .flatten()
-            .filter_map(|&edge_id| self.edges.get(edge_id.index()).map(|e| (edge_id, &e.data)))
+            .filter_map(|&(_, edge_id)| self.edges.get(edge_id.index()).map(|e| (edge_id, &e.data)))
     }
 
     /// Returns an iterator over incoming edges to the given node.
@@ -758,7 +760,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
             .get(node.index())
             .into_iter()
             .flatten()
-            .filter_map(|&edge_id| self.edges.get(edge_id.index()).map(|e| (edge_id, &e.data)))
+            .filter_map(|&(_, edge_id)| self.edges.get(edge_id.index()).map(|e| (edge_id, &e.data)))
     }
 
     /// Returns the out-degree (number of outgoing edges) of a node.
@@ -972,7 +974,7 @@ impl<N: Clone, E> Successors for DirectedGraph<'_, N, E> {
             .get(node.index())
             .into_iter()
             .flatten()
-            .filter_map(|&edge_id| self.edges.get(edge_id.index()).map(|e| e.target))
+            .map(|&(target, _)| target)
     }
 }
 
@@ -983,7 +985,7 @@ impl<N: Clone, E> Predecessors for DirectedGraph<'_, N, E> {
             .get(node.index())
             .into_iter()
             .flatten()
-            .filter_map(|&edge_id| self.edges.get(edge_id.index()).map(|e| e.source))
+            .map(|&(source, _)| source)
     }
 }
 

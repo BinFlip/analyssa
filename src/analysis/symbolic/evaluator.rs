@@ -419,16 +419,34 @@ impl<'a, T: Target> SymbolicEvaluator<'a, T> {
     /// * `right` - The right operand variable.
     /// * `op` - The binary operation to apply.
     fn eval_binary(&mut self, dest: SsaVarId, left: SsaVarId, right: SsaVarId, op: SymbolicOp) {
-        let left_expr = self
-            .expressions
-            .get(&left)
-            .cloned()
-            .unwrap_or_else(|| SymbolicExpr::variable(left));
-        let right_expr = self
-            .expressions
-            .get(&right)
-            .cloned()
-            .unwrap_or_else(|| SymbolicExpr::variable(right));
+        let Some(left_expr) =
+            self.expressions
+                .get(&left)
+                .map_or(Some(SymbolicExpr::variable(left)), |expr| {
+                    if expr.reaches_recursive_depth_limit() {
+                        None
+                    } else {
+                        Some(expr.clone())
+                    }
+                })
+        else {
+            self.expressions.insert(dest, SymbolicExpr::variable(dest));
+            return;
+        };
+        let Some(right_expr) =
+            self.expressions
+                .get(&right)
+                .map_or(Some(SymbolicExpr::variable(right)), |expr| {
+                    if expr.reaches_recursive_depth_limit() {
+                        None
+                    } else {
+                        Some(expr.clone())
+                    }
+                })
+        else {
+            self.expressions.insert(dest, SymbolicExpr::variable(dest));
+            return;
+        };
 
         let result = SymbolicExpr::binary(op, left_expr, right_expr).simplify(self.pointer_size);
         self.expressions.insert(dest, result);
@@ -445,11 +463,20 @@ impl<'a, T: Target> SymbolicEvaluator<'a, T> {
     /// * `operand` - The operand variable.
     /// * `op` - The unary operation to apply.
     fn eval_unary(&mut self, dest: SsaVarId, operand: SsaVarId, op: SymbolicOp) {
-        let operand_expr = self
-            .expressions
-            .get(&operand)
-            .cloned()
-            .unwrap_or_else(|| SymbolicExpr::variable(operand));
+        let Some(operand_expr) =
+            self.expressions
+                .get(&operand)
+                .map_or(Some(SymbolicExpr::variable(operand)), |expr| {
+                    if expr.reaches_recursive_depth_limit() {
+                        None
+                    } else {
+                        Some(expr.clone())
+                    }
+                })
+        else {
+            self.expressions.insert(dest, SymbolicExpr::variable(dest));
+            return;
+        };
 
         let result = SymbolicExpr::unary(op, operand_expr).simplify(self.pointer_size);
         self.expressions.insert(dest, result);

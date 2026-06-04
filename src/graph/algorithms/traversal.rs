@@ -67,6 +67,9 @@ pub struct DfsIterator<'g, G: Successors> {
     stack: Vec<NodeId>,
     /// Tracks which nodes have been visited (indexed by node ID)
     visited: Vec<bool>,
+    /// Reusable buffer for a node's successors, to avoid allocating a fresh
+    /// `Vec` on every step (the trait's successor iterator is not reversible).
+    scratch: Vec<NodeId>,
 }
 
 impl<'g, G: Successors> DfsIterator<'g, G> {
@@ -77,6 +80,7 @@ impl<'g, G: Successors> DfsIterator<'g, G> {
                 graph,
                 stack: Vec::new(),
                 visited: Vec::new(),
+                scratch: Vec::new(),
             };
         }
 
@@ -89,6 +93,7 @@ impl<'g, G: Successors> DfsIterator<'g, G> {
             graph,
             stack: vec![start],
             visited,
+            scratch: Vec::new(),
         }
     }
 }
@@ -102,10 +107,14 @@ impl<G: Successors> Iterator for DfsIterator<'_, G> {
             return None;
         }
 
-        // Push unvisited successors onto the stack in reverse order
-        // so that they are visited in the original order
-        let successors: Vec<NodeId> = self.graph.successors(node).collect();
-        for &succ in successors.iter().rev() {
+        // Push unvisited successors onto the stack in reverse order so they are
+        // visited in the original order. Reuse `scratch` (moved out to avoid
+        // borrowing `self` while pushing onto `self.stack`) to skip a per-step
+        // allocation.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.clear();
+        scratch.extend(self.graph.successors(node));
+        for &succ in scratch.iter().rev() {
             if let Some(slot) = self.visited.get_mut(succ.index()) {
                 if !*slot {
                     *slot = true;
@@ -113,6 +122,7 @@ impl<G: Successors> Iterator for DfsIterator<'_, G> {
                 }
             }
         }
+        self.scratch = scratch;
 
         Some(node)
     }
@@ -333,6 +343,8 @@ pub fn postorder<G: Successors>(graph: &G, start: NodeId) -> Vec<NodeId> {
     }
 
     let mut stack = vec![(start, State::Enter)];
+    // Reused across nodes to avoid allocating a successor `Vec` per node.
+    let mut scratch: Vec<NodeId> = Vec::new();
 
     while let Some((node, state)) = stack.pop() {
         match state {
@@ -349,8 +361,9 @@ pub fn postorder<G: Successors>(graph: &G, start: NodeId) -> Vec<NodeId> {
                 stack.push((node, State::Exit));
 
                 // Push children in reverse order so they're processed in order
-                let successors: Vec<NodeId> = graph.successors(node).collect();
-                for &succ in successors.iter().rev() {
+                scratch.clear();
+                scratch.extend(graph.successors(node));
+                for &succ in scratch.iter().rev() {
                     if let Some(false) = visited.get(succ.index()).copied() {
                         stack.push((succ, State::Enter));
                     }

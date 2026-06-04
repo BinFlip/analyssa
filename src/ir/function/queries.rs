@@ -393,7 +393,7 @@ impl<T: Target> SsaFunction<T> {
                 if let Some(block) = self.block(def.block) {
                     if let Some(instr) = block.instructions().get(instr_idx) {
                         let op = instr.op();
-                        if op.dest() == Some(var) {
+                        if op.defs().any(|def| def == var) {
                             return Some(op);
                         }
                     }
@@ -405,7 +405,7 @@ impl<T: Target> SsaFunction<T> {
         for block in self.blocks() {
             for instr in block.instructions() {
                 let op = instr.op();
-                if op.dest() == Some(var) {
+                if op.defs().any(|def| def == var) {
                     return Some(op);
                 }
             }
@@ -436,7 +436,7 @@ impl<T: Target> SsaFunction<T> {
                 if let Some(block) = self.block(def.block) {
                     if let Some(instr) = block.instructions().get(instr_idx) {
                         let op = instr.op();
-                        if op.dest() == Some(var) {
+                        if op.defs().any(|def| def == var) {
                             return Some(instr);
                         }
                     }
@@ -447,7 +447,7 @@ impl<T: Target> SsaFunction<T> {
         // Slow path: O(n) scan (DefSite may be stale after transforms or from builder)
         for block in self.blocks() {
             for instr in block.instructions() {
-                if instr.op().dest() == Some(var) {
+                if instr.op().defs().any(|def| def == var) {
                     return Some(instr);
                 }
             }
@@ -473,7 +473,7 @@ impl<T: Target> SsaFunction<T> {
     #[must_use]
     pub fn would_create_self_reference(&self, source: SsaVarId, result: SsaVarId) -> bool {
         self.get_definition(source)
-            .is_some_and(|op| op.uses().contains(&result))
+            .is_some_and(|op| op.uses_var(result))
     }
 
     /// Like [`would_create_self_reference`](Self::would_create_self_reference), but only
@@ -705,6 +705,13 @@ impl<T: Target> SsaFunction<T> {
                 self.trace_to_phi_impl(*value, target_block, depth.saturating_add(1))
             }
 
+            // Unary state transforms and conversions: trace through the operand.
+            SsaOp::Neg { operand, .. }
+            | SsaOp::Not { operand, .. }
+            | SsaOp::Conv { operand, .. } => {
+                self.trace_to_phi_impl(*operand, target_block, depth.saturating_add(1))
+            }
+
             // Copy: trace through to source
             SsaOp::Copy { src, .. } => {
                 self.trace_to_phi_impl(*src, target_block, depth.saturating_add(1))
@@ -737,7 +744,7 @@ impl<T: Target> SsaFunction<T> {
             return false;
         };
 
-        op.successors().contains(&to_block)
+        op.has_successor(to_block)
     }
 
     /// Gets all predecessor blocks that can jump to the given block.
@@ -760,7 +767,7 @@ impl<T: Target> SsaFunction<T> {
             .filter_map(|(idx, block)| {
                 block
                     .terminator_op()
-                    .filter(|op| op.successors().contains(&block_idx))
+                    .filter(|op| op.has_successor(block_idx))
                     .map(|_| idx)
             })
             .collect();
@@ -778,6 +785,44 @@ impl<T: Target> SsaFunction<T> {
             }
         }
 
+        preds
+    }
+
+    /// Computes the predecessor list for every block in a single pass.
+    ///
+    /// Returns a vector indexed by block, where entry `b` holds the blocks that
+    /// can transfer control to `b` (including synthetic exception-handler
+    /// edges, matching [`block_predecessors`](Self::block_predecessors)).
+    ///
+    /// This is O(V + E); callers that need predecessors of many blocks should
+    /// use it instead of calling `block_predecessors` per block, which is
+    /// O(V) each and thus O(V²) in a loop.
+    #[must_use]
+    pub fn compute_predecessors(&self) -> Vec<Vec<usize>> {
+        let block_count = self.blocks.len();
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); block_count];
+        for (idx, block) in self.iter_blocks() {
+            block.for_each_successor(|succ| {
+                if let Some(slot) = preds.get_mut(succ) {
+                    if !slot.contains(&idx) {
+                        slot.push(idx);
+                    }
+                }
+            });
+        }
+        for handler in self.exception_handlers() {
+            if let (Some(handler_start), Some(try_start)) =
+                (handler.handler_start_block, handler.try_start_block)
+            {
+                if try_start < block_count {
+                    if let Some(slot) = preds.get_mut(handler_start) {
+                        if !slot.contains(&try_start) {
+                            slot.push(try_start);
+                        }
+                    }
+                }
+            }
+        }
         preds
     }
 
@@ -863,7 +908,7 @@ impl<T: Target> SsaFunction<T> {
         for block in self.blocks() {
             for instr in block.instructions() {
                 let op = instr.op();
-                if op.dest() == Some(var) {
+                if op.defs().any(|def| def == var) {
                     // Check if this is loading from an argument
                     if let SsaOp::Const { .. } = op {
                         // Not a parameter
@@ -917,10 +962,10 @@ impl<T: Target> SsaFunction<T> {
 
             // Count instruction operands
             for instr in block.instructions() {
-                for var in instr.op().uses() {
+                instr.op().for_each_use(|var| {
                     let entry = counts.entry(var).or_insert(0_usize);
                     *entry = entry.saturating_add(1);
-                }
+                });
             }
         }
 
@@ -1021,7 +1066,11 @@ impl<T: Target> SsaFunction<T> {
             .filter(|&(block_idx, _)| exclude_block != Some(block_idx))
             .filter(|(_, block)| {
                 // Check instructions
-                block.instructions().iter().any(|instr| instr.uses().contains(&var))
+                block.instructions().iter().any(|instr| {
+                    let mut found = false;
+                    instr.for_each_use(|used| found |= used == var);
+                    found
+                })
                     // Check phi operands
                     || block.phi_nodes().iter().any(|phi| {
                         phi.operands().iter().any(|op| op.value() == var)

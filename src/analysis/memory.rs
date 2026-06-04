@@ -102,7 +102,11 @@ use crate::{
         algorithms::{compute_dominance_frontiers, compute_dominators},
         GraphBase, NodeId, RootedGraph, Successors,
     },
-    ir::{function::SsaFunction, ops::SsaOp, variable::SsaVarId},
+    ir::{
+        function::SsaFunction,
+        ops::{MemoryEffectLocation, SsaEffectKind, SsaEffects, SsaOp},
+        variable::SsaVarId,
+    },
     target::Target,
 };
 
@@ -300,6 +304,28 @@ pub enum MemoryOp<T: Target> {
         /// Instruction index within the block.
         instr: usize,
     },
+    /// A memory operation that both reads and writes, or whose value operand is implicit.
+    ReadWrite {
+        /// The memory location being read and written.
+        location: MemoryLocation<T>,
+        /// Effect summary attached to this operation.
+        effects: SsaEffects,
+        /// Block containing this operation.
+        block: usize,
+        /// Instruction index within the block.
+        instr: usize,
+    },
+    /// A memory barrier, call, or opaque operation that constrains memory state.
+    Barrier {
+        /// Conservative memory location affected by the barrier.
+        location: MemoryLocation<T>,
+        /// Effect summary attached to this barrier.
+        effects: SsaEffects,
+        /// Block containing this operation.
+        block: usize,
+        /// Instruction index within the block.
+        instr: usize,
+    },
 }
 
 impl<T: Target> MemoryOp<T> {
@@ -307,7 +333,10 @@ impl<T: Target> MemoryOp<T> {
     #[must_use]
     pub fn location(&self) -> &MemoryLocation<T> {
         match self {
-            Self::Load { location, .. } | Self::Store { location, .. } => location,
+            Self::Load { location, .. }
+            | Self::Store { location, .. }
+            | Self::ReadWrite { location, .. }
+            | Self::Barrier { location, .. } => location,
         }
     }
 
@@ -315,7 +344,10 @@ impl<T: Target> MemoryOp<T> {
     #[must_use]
     pub fn block(&self) -> usize {
         match self {
-            Self::Load { block, .. } | Self::Store { block, .. } => *block,
+            Self::Load { block, .. }
+            | Self::Store { block, .. }
+            | Self::ReadWrite { block, .. }
+            | Self::Barrier { block, .. } => *block,
         }
     }
 
@@ -323,7 +355,10 @@ impl<T: Target> MemoryOp<T> {
     #[must_use]
     pub fn instr(&self) -> usize {
         match self {
-            Self::Load { instr, .. } | Self::Store { instr, .. } => *instr,
+            Self::Load { instr, .. }
+            | Self::Store { instr, .. }
+            | Self::ReadWrite { instr, .. }
+            | Self::Barrier { instr, .. } => *instr,
         }
     }
 
@@ -333,10 +368,28 @@ impl<T: Target> MemoryOp<T> {
         matches!(self, Self::Store { .. })
     }
 
+    /// Returns `true` if this operation defines a new memory version.
+    #[must_use]
+    pub fn defines_memory(&self) -> bool {
+        matches!(
+            self,
+            Self::Store { .. } | Self::ReadWrite { .. } | Self::Barrier { .. }
+        )
+    }
+
     /// Returns `true` if this is a load operation.
     #[must_use]
     pub fn is_load(&self) -> bool {
         matches!(self, Self::Load { .. })
+    }
+
+    /// Returns the detailed effect summary for classified effectful operations.
+    #[must_use]
+    pub fn effects(&self) -> Option<SsaEffects> {
+        match self {
+            Self::ReadWrite { effects, .. } | Self::Barrier { effects, .. } => Some(*effects),
+            Self::Load { .. } | Self::Store { .. } => None,
+        }
     }
 }
 
@@ -657,7 +710,52 @@ impl<T: Target> MemorySsa<T> {
                     instr,
                 })
             }
-            _ => None,
+            _ => {
+                let effects = op.effects();
+                match effects.kind {
+                    SsaEffectKind::ReadWrite | SsaEffectKind::Atomic => Some(MemoryOp::ReadWrite {
+                        location: MemoryLocation::Unknown,
+                        effects,
+                        block,
+                        instr,
+                    }),
+                    SsaEffectKind::Fence | SsaEffectKind::Call if !effects.is_pure() => {
+                        Some(MemoryOp::Barrier {
+                            location: MemoryLocation::Unknown,
+                            effects,
+                            block,
+                            instr,
+                        })
+                    }
+                    SsaEffectKind::Opaque
+                        if !effects.is_pure()
+                            && !matches!(effects.memory, MemoryEffectLocation::None) =>
+                    {
+                        Some(MemoryOp::Barrier {
+                            location: MemoryLocation::Unknown,
+                            effects,
+                            block,
+                            instr,
+                        })
+                    }
+                    SsaEffectKind::Read => op.dest().map(|dest| MemoryOp::Load {
+                        location: MemoryLocation::Unknown,
+                        dest,
+                        block,
+                        instr,
+                    }),
+                    SsaEffectKind::Write => Some(MemoryOp::ReadWrite {
+                        location: MemoryLocation::Unknown,
+                        effects,
+                        block,
+                        instr,
+                    }),
+                    SsaEffectKind::Pure
+                    | SsaEffectKind::Fence
+                    | SsaEffectKind::Call
+                    | SsaEffectKind::Opaque => None,
+                }
+            }
         }
     }
 
@@ -682,7 +780,7 @@ impl<T: Target> MemorySsa<T> {
         // For each memory location, find blocks that define it (stores)
         let mut def_blocks: HashMap<MemoryLocation<T>, BTreeSet<usize>> = HashMap::new();
         for op in &self.operations {
-            if op.is_store() {
+            if op.defines_memory() {
                 def_blocks
                     .entry(op.location().clone())
                     .or_default()
@@ -818,7 +916,7 @@ impl<T: Target> MemorySsa<T> {
             // Handle stores - create new version
             if let Some(mem_op) = Self::classify_memory_operation(instr.op(), block_idx, instr_idx)
             {
-                if mem_op.is_store() {
+                if mem_op.defines_memory() {
                     let location = mem_op.location().clone();
                     let new_version = self.allocate_version(&location);
                     version_stacks
@@ -862,14 +960,24 @@ impl<T: Target> MemorySsa<T> {
     #[must_use]
     pub fn stats(&self) -> MemorySsaStats {
         let total_phis = self.memory_phis.values().map(Vec::len).sum();
-        let store_count = self.operations.iter().filter(|op| op.is_store()).count();
+        let store_count = self
+            .operations
+            .iter()
+            .filter(|op| matches!(op, MemoryOp::Store { .. } | MemoryOp::ReadWrite { .. }))
+            .count();
         let load_count = self.operations.iter().filter(|op| op.is_load()).count();
+        let barrier_count = self
+            .operations
+            .iter()
+            .filter(|op| matches!(op, MemoryOp::Barrier { .. }))
+            .count();
 
         MemorySsaStats {
             location_count: self.locations.len(),
             memory_phi_count: total_phis,
             store_count,
             load_count,
+            barrier_count,
             version_count: self.definitions.len(),
         }
     }
@@ -892,6 +1000,8 @@ pub struct MemorySsaStats {
     pub store_count: usize,
     /// Number of load operations.
     pub load_count: usize,
+    /// Number of barrier, call, or opaque memory operations.
+    pub barrier_count: usize,
     /// Total number of memory versions.
     pub version_count: usize,
 }

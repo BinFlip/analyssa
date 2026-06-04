@@ -1,7 +1,5 @@
 //! Symbolic expression evaluation tests.
 
-#![allow(clippy::unwrap_used)]
-
 use analyssa::{
     analysis::{
         evaluator::SsaEvaluator,
@@ -18,6 +16,10 @@ use analyssa::{
     testing::{MockTarget, MockType},
     PointerSize,
 };
+
+fn some_or_abort<T>(value: Option<T>) -> T {
+    value.unwrap_or_else(|| std::process::abort())
+}
 
 fn local(ssa: &mut SsaFunction<MockTarget>, idx: u16, block: usize, instr: usize) -> SsaVarId {
     ssa.create_variable(
@@ -141,11 +143,11 @@ fn symbolic_evaluator_tracks_expressions() {
 
     let c_expr = sym_eval.get_expression(const_val);
     assert!(c_expr.is_some());
-    assert!(c_expr.unwrap().is_constant());
+    assert!(some_or_abort(c_expr).is_constant());
 
     let s_expr = sym_eval.get_expression(sum);
     assert!(s_expr.is_some());
-    assert!(matches!(s_expr.unwrap(), SymbolicExpr::Binary { .. }));
+    assert!(matches!(some_or_abort(s_expr), SymbolicExpr::Binary { .. }));
 
     // param may or may not have an expression (entry-point variables are
     // not tracked unless explicitly set_symbolic is called)
@@ -180,7 +182,7 @@ fn symbolic_expr_tracks_through_copy() {
 
     let expr = sym_eval.get_expression(b);
     assert!(expr.is_some());
-    assert!(expr.unwrap().is_constant());
+    assert!(some_or_abort(expr).is_constant());
 }
 
 #[test]

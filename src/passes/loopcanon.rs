@@ -38,7 +38,7 @@ use crate::{
     events::{EventKind, EventListener},
     ir::{
         block::SsaBlock,
-        function::SsaFunction,
+        function::{SsaEditOptions, SsaFunction},
         instruction::SsaInstruction,
         ops::SsaOp,
         phi::{PhiNode, PhiOperand},
@@ -142,6 +142,16 @@ fn get_targets<T: Target>(op: &SsaOp<T>) -> Vec<usize> {
             true_target,
             false_target,
             ..
+        }
+        | SsaOp::BranchCmp {
+            true_target,
+            false_target,
+            ..
+        }
+        | SsaOp::BranchFlags {
+            true_target,
+            false_target,
+            ..
         } => vec![*true_target, *false_target],
         SsaOp::Switch {
             targets, default, ..
@@ -150,6 +160,9 @@ fn get_targets<T: Target>(op: &SsaOp<T>) -> Vec<usize> {
             all.push(*default);
             all
         }
+        SsaOp::IndirectBranch {
+            resolved_targets, ..
+        } => resolved_targets.clone(),
         _ => vec![],
     }
 }
@@ -166,12 +179,6 @@ fn insert_preheader<T, L>(
 {
     let header_idx = loop_info.header.index();
     let preheader_idx = ssa.block_count();
-
-    let mut preheader: SsaBlock<T> = SsaBlock::new(preheader_idx);
-    preheader.add_instruction(SsaInstruction::synthetic(SsaOp::Jump {
-        target: header_idx,
-    }));
-
     let phi_info: Vec<(VariableOrigin, Vec<PhiOperand>)> = ssa
         .block(header_idx)
         .map(|header| {
@@ -194,57 +201,72 @@ fn insert_preheader<T, L>(
                 .collect()
         })
         .unwrap_or_default();
-
-    for (origin, operands) in &phi_info {
-        let new_var = ssa.create_variable_for_origin(*origin, 0, DefSite::phi(preheader_idx));
-        let mut preheader_phi = PhiNode::new(new_var, *origin);
-        for op in operands {
-            preheader_phi.add_operand(*op);
-        }
-        preheader.phi_nodes_mut().push(preheader_phi);
-    }
-
-    ssa.add_block(preheader);
-
-    for &pred_idx in non_loop_preds {
-        redirect_targets(ssa, pred_idx, header_idx, preheader_idx);
-    }
-
-    let preheader_phi_map: HashMap<VariableOrigin, SsaVarId> = ssa
-        .block(preheader_idx)
-        .map(|b| {
-            b.phi_nodes()
+    let header_phi_operands: Vec<(VariableOrigin, Vec<PhiOperand>)> = ssa
+        .block(header_idx)
+        .map(|header| {
+            header
+                .phi_nodes()
                 .iter()
-                .map(|p| (p.origin(), p.result()))
+                .map(|phi| {
+                    let non_loop_operands = phi
+                        .operands()
+                        .iter()
+                        .filter(|op| non_loop_preds.contains(&op.predecessor()))
+                        .copied()
+                        .collect();
+                    (phi.origin(), non_loop_operands)
+                })
                 .collect()
         })
         .unwrap_or_default();
 
-    if let Some(header) = ssa.block_mut(header_idx) {
-        for phi in header.phi_nodes_mut() {
-            let origin = phi.origin();
-            let operands = phi.operands_mut();
-            let mut loop_operands: Vec<PhiOperand> = Vec::new();
-            let mut non_loop_values: Vec<PhiOperand> = Vec::new();
+    let result = ssa.edit(SsaEditOptions::new(), |editor| {
+        let mut preheader = SsaBlock::new(preheader_idx);
+        let mut preheader_phi_map: HashMap<VariableOrigin, SsaVarId> = HashMap::new();
 
-            for op in operands.drain(..) {
-                if non_loop_preds.contains(&op.predecessor()) {
-                    non_loop_values.push(op);
-                } else {
-                    loop_operands.push(op);
-                }
+        for (origin, operands) in &phi_info {
+            let new_var =
+                editor.create_variable_for_origin(*origin, 0, DefSite::phi(preheader_idx));
+            let mut preheader_phi = PhiNode::new(new_var, *origin);
+            for op in operands {
+                preheader_phi.add_operand(*op);
             }
-
-            operands.extend(loop_operands);
-
-            if !non_loop_values.is_empty() {
-                if let [single] = non_loop_values.as_slice() {
-                    operands.push(PhiOperand::new(single.value(), preheader_idx));
-                } else if let Some(&preheader_var) = preheader_phi_map.get(&origin) {
-                    operands.push(PhiOperand::new(preheader_var, preheader_idx));
-                }
-            }
+            preheader_phi_map.insert(*origin, new_var);
+            preheader.phi_nodes_mut().push(preheader_phi);
         }
+
+        preheader.add_instruction(SsaInstruction::synthetic(SsaOp::Jump {
+            target: header_idx,
+        }));
+        editor.append_block(preheader)?;
+
+        for &pred_idx in non_loop_preds {
+            editor.redirect_terminator_target_structured(pred_idx, header_idx, preheader_idx)?;
+        }
+
+        for (origin, non_loop_values) in &header_phi_operands {
+            if non_loop_values.is_empty() {
+                continue;
+            }
+            let replacement = if let [single] = non_loop_values.as_slice() {
+                single.value()
+            } else if let Some(&preheader_var) = preheader_phi_map.get(origin) {
+                preheader_var
+            } else {
+                continue;
+            };
+            editor.replace_phi_predecessor_group_for_origin(
+                header_idx,
+                *origin,
+                non_loop_preds,
+                PhiOperand::new(replacement, preheader_idx),
+            )?;
+        }
+
+        Ok(())
+    });
+    if result.is_err() {
+        return;
     }
 
     let event = crate::events::Event {
@@ -269,13 +291,6 @@ fn unify_latches<T, L>(
     let header_idx = loop_info.header.index();
     let latches: Vec<usize> = loop_info.latches.iter().map(|n| n.index()).collect();
     let unified_latch_idx = ssa.block_count();
-
-    let mut unified_latch: SsaBlock<T> = SsaBlock::new(unified_latch_idx);
-    unified_latch.add_instruction(SsaInstruction::synthetic(SsaOp::Jump {
-        target: header_idx,
-    }));
-
-    let mut latch_phi_vars: HashMap<VariableOrigin, SsaVarId> = HashMap::new();
     let phi_info: Vec<(VariableOrigin, Vec<PhiOperand>)> = ssa
         .block(header_idx)
         .map(|header| {
@@ -295,36 +310,53 @@ fn unify_latches<T, L>(
         })
         .unwrap_or_default();
 
-    for (origin, latch_operands) in &phi_info {
-        if latch_operands.len() > 1 {
-            let new_var =
-                ssa.create_variable_for_origin(*origin, 0, DefSite::phi(unified_latch_idx));
-            let mut latch_phi = PhiNode::new(new_var, *origin);
-            for op in latch_operands {
-                latch_phi.add_operand(*op);
-            }
-            latch_phi_vars.insert(*origin, new_var);
-            unified_latch.phi_nodes_mut().push(latch_phi);
-        } else if let [single] = latch_operands.as_slice() {
-            latch_phi_vars.insert(*origin, single.value());
-        }
-    }
+    let result = ssa.edit(SsaEditOptions::new(), |editor| {
+        let mut unified_latch = SsaBlock::new(unified_latch_idx);
+        let mut latch_phi_vars: HashMap<VariableOrigin, SsaVarId> = HashMap::new();
 
-    ssa.add_block(unified_latch);
-
-    for &latch_idx in &latches {
-        redirect_targets(ssa, latch_idx, header_idx, unified_latch_idx);
-    }
-
-    if let Some(header) = ssa.block_mut(header_idx) {
-        for phi in header.phi_nodes_mut() {
-            let origin = phi.origin();
-            let operands = phi.operands_mut();
-            operands.retain(|op| !latches.contains(&op.predecessor()));
-            if let Some(&var) = latch_phi_vars.get(&origin) {
-                operands.push(PhiOperand::new(var, unified_latch_idx));
+        for (origin, latch_operands) in &phi_info {
+            if latch_operands.len() > 1 {
+                let new_var =
+                    editor.create_variable_for_origin(*origin, 0, DefSite::phi(unified_latch_idx));
+                let mut latch_phi = PhiNode::new(new_var, *origin);
+                for op in latch_operands {
+                    latch_phi.add_operand(*op);
+                }
+                latch_phi_vars.insert(*origin, new_var);
+                unified_latch.phi_nodes_mut().push(latch_phi);
+            } else if let [single] = latch_operands.as_slice() {
+                latch_phi_vars.insert(*origin, single.value());
             }
         }
+
+        unified_latch.add_instruction(SsaInstruction::synthetic(SsaOp::Jump {
+            target: header_idx,
+        }));
+        editor.append_block(unified_latch)?;
+
+        for &latch_idx in &latches {
+            editor.redirect_terminator_target_structured(
+                latch_idx,
+                header_idx,
+                unified_latch_idx,
+            )?;
+        }
+
+        for (origin, _) in &phi_info {
+            if let Some(&var) = latch_phi_vars.get(origin) {
+                editor.replace_phi_predecessor_group_for_origin(
+                    header_idx,
+                    *origin,
+                    &latches,
+                    PhiOperand::new(var, unified_latch_idx),
+                )?;
+            }
+        }
+
+        Ok(())
+    });
+    if result.is_err() {
+        return;
     }
 
     let event = crate::events::Event {
@@ -342,85 +374,10 @@ fn unify_latches<T, L>(
     events.push(event);
 }
 
-fn redirect_targets<T: Target>(
-    ssa: &mut SsaFunction<T>,
-    block_idx: usize,
-    old_target: usize,
-    new_target: usize,
-) {
-    if let Some(block) = ssa.block_mut(block_idx) {
-        if let Some(last) = block.instructions_mut().last_mut() {
-            let new_op = match last.op() {
-                SsaOp::Jump { target } if *target == old_target => {
-                    Some(SsaOp::Jump { target: new_target })
-                }
-                SsaOp::Leave { target } if *target == old_target => {
-                    Some(SsaOp::Leave { target: new_target })
-                }
-                SsaOp::Branch {
-                    condition,
-                    true_target,
-                    false_target,
-                } => {
-                    let new_true = if *true_target == old_target {
-                        new_target
-                    } else {
-                        *true_target
-                    };
-                    let new_false = if *false_target == old_target {
-                        new_target
-                    } else {
-                        *false_target
-                    };
-                    if new_true != *true_target || new_false != *false_target {
-                        Some(SsaOp::Branch {
-                            condition: *condition,
-                            true_target: new_true,
-                            false_target: new_false,
-                        })
-                    } else {
-                        None
-                    }
-                }
-                SsaOp::Switch {
-                    value,
-                    targets,
-                    default,
-                } => {
-                    let new_targets: Vec<_> = targets
-                        .iter()
-                        .map(|&t| if t == old_target { new_target } else { t })
-                        .collect();
-                    let new_default = if *default == old_target {
-                        new_target
-                    } else {
-                        *default
-                    };
-                    if new_targets != *targets || new_default != *default {
-                        Some(SsaOp::Switch {
-                            value: *value,
-                            targets: new_targets,
-                            default: new_default,
-                        })
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            if let Some(new_op) = new_op {
-                last.set_op(new_op);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        analysis::SsaVerifier,
-        analysis::VerifyLevel,
         events::EventLog,
         ir::{
             block::SsaBlock,
@@ -429,7 +386,7 @@ mod tests {
             value::ConstValue,
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
-        testing::{MockTarget, MockType},
+        testing::{assert_mock_valid_full, run_mock_pass_boundary, MockTarget, MockType},
     };
 
     fn instr(op: SsaOp<MockTarget>) -> SsaInstruction<MockTarget> {
@@ -460,7 +417,7 @@ mod tests {
     }
 
     fn build_loop_with_multiple_latches() -> SsaFunction<MockTarget> {
-        let mut ssa = SsaFunction::new(0, 6);
+        let mut ssa = SsaFunction::new(0, 8);
         let init = local_at(&mut ssa, 0, 0, 0);
         let one = local_at(&mut ssa, 1, 0, 1);
         let limit = local_at(&mut ssa, 2, 0, 2);
@@ -468,7 +425,9 @@ mod tests {
         let cond = local_at(&mut ssa, 4, 1, 0);
         let next = local_at(&mut ssa, 5, 2, 0);
         let alt_next = local_at(&mut ssa, 6, 3, 0);
+        let branch_cond = local_at(&mut ssa, 7, 5, 0);
 
+        // Preheader (B0)
         let mut b0 = SsaBlock::new(0);
         b0.add_instruction(instr(SsaOp::Const {
             dest: init,
@@ -485,6 +444,7 @@ mod tests {
         b0.add_instruction(instr(SsaOp::Jump { target: 1 }));
         ssa.add_block(b0);
 
+        // Header (B1): both latches feed the induction phi.
         let mut b1 = SsaBlock::new(1);
         let mut phi = PhiNode::new(i_phi, VariableOrigin::Local(3));
         phi.add_operand(PhiOperand::new(init, 0));
@@ -499,7 +459,7 @@ mod tests {
         }));
         b1.add_instruction(instr(SsaOp::Branch {
             condition: cond,
-            true_target: 2,
+            true_target: 5,
             false_target: 4,
         }));
         ssa.add_block(b1);
@@ -531,6 +491,22 @@ mod tests {
         b4.add_instruction(instr(SsaOp::Return { value: Some(i_phi) }));
         ssa.add_block(b4);
 
+        // Body (B5): conditionally reaches either latch, so both are genuine
+        // reachable back-edges to the header.
+        let mut b5 = SsaBlock::new(5);
+        b5.add_instruction(instr(SsaOp::Clt {
+            dest: branch_cond,
+            left: i_phi,
+            right: one,
+            unsigned: false,
+        }));
+        b5.add_instruction(instr(SsaOp::Branch {
+            condition: branch_cond,
+            true_target: 2,
+            false_target: 3,
+        }));
+        ssa.add_block(b5);
+
         ssa.recompute_uses();
         ssa
     }
@@ -542,15 +518,17 @@ mod tests {
         let method = 0u32;
 
         let original_blocks = ssa.block_count();
-        let changed = run(&mut ssa, &method, &log);
+        let changed =
+            run_mock_pass_boundary(&mut ssa, "multiple-latch loop canonicalization", |ssa| {
+                run(ssa, &method, &log)
+            });
         assert!(changed, "multiple latches should be unified");
         assert!(
             ssa.block_count() > original_blocks,
             "should add a unified latch block"
         );
 
-        let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
-        assert!(errors.is_empty(), "verifier errors: {errors:?}");
+        assert_mock_valid_full(&ssa, "multiple-latch canonical loop");
     }
 
     #[test]
@@ -614,7 +592,10 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log);
+        let changed =
+            run_mock_pass_boundary(&mut ssa, "single-latch loop canonicalization", |ssa| {
+                run(ssa, &method, &log)
+            });
         assert!(!changed, "single latch should already be canonical");
     }
 
@@ -623,7 +604,9 @@ mod tests {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log);
+        let changed = run_mock_pass_boundary(&mut ssa, "empty loop canonicalization", |ssa| {
+            run(ssa, &method, &log)
+        });
         assert!(!changed);
     }
 
@@ -642,7 +625,10 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log);
+        let changed =
+            run_mock_pass_boundary(&mut ssa, "single-block loop canonicalization", |ssa| {
+                run(ssa, &method, &log)
+            });
         assert!(!changed, "single block cannot have a loop");
     }
 
@@ -652,11 +638,20 @@ mod tests {
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
 
-        let _ = run(&mut ssa, &method, &log);
+        let first_changed =
+            run_mock_pass_boundary(&mut ssa, "first loop canonicalization", |ssa| {
+                run(ssa, &method, &log)
+            });
+        assert!(
+            first_changed,
+            "first canonicalization should rewrite the loop"
+        );
         let after_first = ssa.block_count();
 
         // Second run should be idempotent
-        let changed = run(&mut ssa, &method, &log);
+        let changed = run_mock_pass_boundary(&mut ssa, "idempotent loop canonicalization", |ssa| {
+            run(ssa, &method, &log)
+        });
         assert!(!changed, "second canonicalization should be a no-op");
         assert_eq!(ssa.block_count(), after_first);
     }
@@ -745,10 +740,12 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log);
+        let changed =
+            run_mock_pass_boundary(&mut ssa, "preheader-and-latch canonicalization", |ssa| {
+                run(ssa, &method, &log)
+            });
         assert!(changed, "loop with both issues should be canonicalized");
 
-        let errors = SsaVerifier::new(&ssa).verify(VerifyLevel::Standard);
-        assert!(errors.is_empty(), "verifier errors: {errors:?}");
+        assert_mock_valid_full(&ssa, "preheader-and-latch canonical loop");
     }
 }

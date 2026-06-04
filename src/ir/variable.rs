@@ -8,7 +8,7 @@
 //!
 //! | Type | Purpose |
 //! |------|---------|
-//! | [`SsaVarId`] | Lightweight handle (wraps `usize`) for O(1) variable lookup |
+//! | [`SsaVarId`] | Lightweight niche-bearing handle for O(1) variable lookup |
 //! | [`VariableOrigin`] | Tracks the CIL source: argument, local, or phi node |
 //! | [`SsaVariable`] | Full metadata: ID, origin, version, type, def/use sites |
 //! | [`DefSite`] / [`UseSite`] | Location tracking for def-use chain construction |
@@ -44,7 +44,7 @@
 //! ([`UseSite`]). This enables direct def-use chain traversal without scanning
 //! all instructions, supporting dead code elimination and constant propagation.
 
-use std::fmt;
+use std::{cmp::Ordering, fmt, num::NonZeroU32};
 
 use crate::target::Target;
 
@@ -57,16 +57,21 @@ use crate::target::Target;
 ///
 /// # Memory Layout
 ///
-/// Uses `usize` internally to match native indexing, avoiding conversions
-/// when accessing variable tables.
+/// Internally a [`NonZeroU32`] storing the bitwise complement of the index.
+/// This gives `SsaVarId` a niche, so `Option<SsaVarId>` is 4 bytes instead of
+/// 8/16, which matters because many [`SsaOp`](crate::ir::SsaOp) operands are
+/// `Option<SsaVarId>` (e.g. optional flags destinations). Indices are dense and
+/// per-function, so the 32-bit range (~4.29 billion) is never exhausted; the
+/// two highest indices are reserved (one as the [`PLACEHOLDER`](Self::PLACEHOLDER)
+/// sentinel, one as the `Option` niche).
 ///
 /// # Construction
 ///
 /// Variable IDs are allocated by [`FunctionVarAllocator`] through
 /// [`SsaFunction::create_variable()`](crate::ir::function::SsaFunction::create_variable).
 /// Use [`SsaVarId::from_index()`] only to reconstruct IDs from stored indices.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct SsaVarId(usize);
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SsaVarId(NonZeroU32);
 
 impl SsaVarId {
     /// A sentinel value representing an uninitialized or placeholder variable ID.
@@ -74,12 +79,15 @@ impl SsaVarId {
     /// This is used during phi placement and other construction phases where a
     /// real variable ID hasn't been assigned yet. Placeholder IDs must be replaced
     /// with real IDs before the SSA function is finalized.
-    pub const PLACEHOLDER: Self = Self(usize::MAX);
+    ///
+    /// Encoded as the reserved top of the index range (`u32::MAX - 1`), stored
+    /// as the complement value `1` ([`NonZeroU32::MIN`]).
+    pub const PLACEHOLDER: Self = Self(NonZeroU32::MIN);
 
     /// Returns `true` if this is the placeholder sentinel value.
     #[must_use]
     pub const fn is_placeholder(self) -> bool {
-        self.0 == usize::MAX
+        self.0.get() == NonZeroU32::MIN.get()
     }
 
     /// Creates an `SsaVarId` from an index value.
@@ -89,12 +97,23 @@ impl SsaVarId {
     /// numbering within each function. This method is also used to reconstruct
     /// IDs from stored indices (e.g., in BitSets).
     ///
+    /// The index is stored as its bitwise complement so that index `0` becomes a
+    /// non-zero value (giving the type its `Option` niche). Indices at or above
+    /// the reserved top of the range collapse onto [`PLACEHOLDER`](Self::PLACEHOLDER);
+    /// dense per-function indices never reach that far.
+    ///
     /// # Arguments
     ///
     /// * `index` - The index value for this variable ID
     #[must_use]
     pub const fn from_index(index: usize) -> Self {
-        Self(index)
+        // `!idx` is zero only when `idx == u32::MAX`; that single unrepresentable
+        // index folds onto the placeholder sentinel rather than panicking.
+        let idx = index as u32;
+        match NonZeroU32::new(!idx) {
+            Some(stored) => Self(stored),
+            None => Self::PLACEHOLDER,
+        }
     }
 
     /// Returns the underlying index.
@@ -103,19 +122,40 @@ impl SsaVarId {
     /// (0, 1, 2, ...), enabling O(1) lookup via `variables[id.index()]`.
     #[must_use]
     pub const fn index(self) -> usize {
-        self.0
+        // Undo the complement encoding applied in `from_index`.
+        (!self.0.get()) as usize
+    }
+}
+
+impl Default for SsaVarId {
+    fn default() -> Self {
+        Self::from_index(0)
+    }
+}
+
+impl PartialOrd for SsaVarId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SsaVarId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Order by logical index, not by the complement-encoded storage (which
+        // would reverse the ordering).
+        self.index().cmp(&other.index())
     }
 }
 
 impl fmt::Debug for SsaVarId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "v{}", self.0)
+        write!(f, "v{}", self.index())
     }
 }
 
 impl fmt::Display for SsaVarId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "v{}", self.0)
+        write!(f, "v{}", self.index())
     }
 }
 

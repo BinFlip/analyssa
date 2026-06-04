@@ -79,8 +79,10 @@
 //! assert_eq!(sum.max(), Some(256));
 //! ```
 
-use std::cmp::{max, min};
-use std::fmt;
+use std::{
+    cmp::{max, min},
+    fmt,
+};
 
 /// A range of possible integer values for analysis.
 ///

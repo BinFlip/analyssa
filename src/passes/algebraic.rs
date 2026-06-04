@@ -26,7 +26,12 @@ use std::collections::BTreeMap;
 use crate::{
     analysis::algebraic::{simplify_op, SimplifyResult},
     events::{EventKind, EventListener},
-    ir::{function::SsaFunction, ops::SsaOp, value::ConstValue, variable::SsaVarId},
+    ir::{
+        function::{SsaEditOptions, SsaFunction},
+        ops::SsaOp,
+        value::ConstValue,
+        variable::SsaVarId,
+    },
     target::Target,
 };
 
@@ -99,6 +104,9 @@ fn check_simplification<T: Target>(
     instr_idx: usize,
     constants: &BTreeMap<SsaVarId, ConstValue<T>>,
 ) -> Option<SimplificationCandidate<T>> {
+    if op.defs().count() != 1 {
+        return None;
+    }
     let dest = op.dest()?;
     match simplify_op(op, constants) {
         SimplifyResult::Constant(value) => Some(SimplificationCandidate {
@@ -130,35 +138,37 @@ where
     L: EventListener<T> + ?Sized,
 {
     let mut changed = false;
-    for candidate in candidates {
-        let Some(block) = ssa.block_mut(candidate.block_idx) else {
-            continue;
-        };
-        let Some(instr) = block.instructions_mut().get_mut(candidate.instr_idx) else {
-            continue;
-        };
-        let new_op = match candidate.simplification {
-            Simplification::Constant(value) => SsaOp::Const {
-                dest: candidate.dest,
-                value,
-            },
-            Simplification::Copy(src) => SsaOp::Copy {
-                dest: candidate.dest,
-                src,
-            },
-        };
-        instr.set_op(new_op);
-        changed = true;
+    let result = ssa.edit(SsaEditOptions::new(), |editor| {
+        for candidate in candidates {
+            let new_op = match candidate.simplification {
+                Simplification::Constant(value) => SsaOp::Const {
+                    dest: candidate.dest,
+                    value,
+                },
+                Simplification::Copy(src) => SsaOp::Copy {
+                    dest: candidate.dest,
+                    src,
+                },
+            };
+            editor.replace_instruction_op(candidate.block_idx, candidate.instr_idx, new_op)?;
+            changed = true;
 
-        let event = crate::events::Event {
-            kind: EventKind::ConstantFolded,
-            method: Some(method.clone()),
-            location: Some(candidate.instr_idx),
-            message: candidate.description.to_string(),
-            pass: None,
-        };
-        events.push(event);
+            let event = crate::events::Event {
+                kind: EventKind::ConstantFolded,
+                method: Some(method.clone()),
+                location: Some(candidate.instr_idx),
+                message: candidate.description.to_string(),
+                pass: None,
+            };
+            events.push(event);
+        }
+        Ok(())
+    });
+
+    if result.is_err() {
+        return false;
     }
+
     changed
 }
 
@@ -172,7 +182,7 @@ mod tests {
             instruction::SsaInstruction,
             variable::{DefSite, VariableOrigin},
         },
-        testing::{MockTarget, MockType},
+        testing::{mock_op_at, run_mock_pass_boundary, MockTarget, MockType},
         NullListener,
     };
 
@@ -224,7 +234,11 @@ mod tests {
             right: left_var,
             flags: None,
         }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
+            value: Some(dest_var),
+        }));
         f.add_block(block);
+        f.recompute_uses();
         f
     }
 
@@ -237,13 +251,14 @@ mod tests {
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0xABu32;
 
-        let changed = run(&mut ssa, &method, &log);
+        let changed = run_mock_pass_boundary(&mut ssa, "xor-self algebraic rewrite", |ssa| {
+            run(ssa, &method, &log)
+        });
         assert!(changed);
         assert_eq!(log.count_kind(EventKind::ConstantFolded), 1);
 
         // The third instruction should now be a Const, not Xor.
-        let third = ssa.block(0).unwrap().instructions().get(2).unwrap();
-        match third.op() {
+        match mock_op_at(&ssa, 0, 2) {
             SsaOp::Const {
                 value: ConstValue::I32(0),
                 dest: d,
@@ -259,7 +274,9 @@ mod tests {
         let dest = SsaVarId::from_index(2);
         let mut ssa = build_xor(left, right, dest);
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &NullListener);
+        let changed = run_mock_pass_boundary(&mut ssa, "null-listener algebraic rewrite", |ssa| {
+            run(ssa, &method, &NullListener)
+        });
         assert!(changed);
     }
 
@@ -270,7 +287,9 @@ mod tests {
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
 
-        let changed = run(&mut ssa, &method, &log);
+        let changed = run_mock_pass_boundary(&mut ssa, "empty algebraic pass", |ssa| {
+            run(ssa, &method, &log)
+        });
         assert!(!changed);
         assert!(log.is_empty());
     }
@@ -636,11 +655,16 @@ mod tests {
             right: v0,
             flags: None,
         }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(v3) }));
         ssa.add_block(block);
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log);
+        ssa.recompute_uses();
+        let changed =
+            run_mock_pass_boundary(&mut ssa, "multiple algebraic simplifications", |ssa| {
+                run(ssa, &method, &log)
+            });
         assert!(changed);
         // Should have simplified both ops
         assert!(log.count_kind(EventKind::ConstantFolded) >= 2);
@@ -667,7 +691,10 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log);
+        ssa.recompute_uses();
+        let changed = run_mock_pass_boundary(&mut ssa, "constant-only algebraic no-op", |ssa| {
+            run(ssa, &method, &log)
+        });
         assert!(!changed);
         assert!(log.is_empty());
     }

@@ -145,8 +145,9 @@ impl From<NodeId> for usize {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::{HashMap, HashSet};
+
+    use super::*;
 
     #[test]
     fn test_node_id_new() {

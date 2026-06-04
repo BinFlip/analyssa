@@ -52,7 +52,11 @@ pub mod variable;
 
 pub use block::{ReplaceResult, SsaBlock};
 pub use exception::{native_is_filter_handler, NativeExceptionKind, SsaExceptionHandler};
-pub use function::{FunctionKind, MethodPurity, ReturnInfo, SsaFunction, TrivialPhiOptions};
+pub use function::{
+    CheckedReplaceResult, FunctionKind, MethodPurity, ReplacementSkipReason, ReturnInfo,
+    SkippedReplacement, SsaBlockBuilder, SsaDefSpec, SsaEditOptions, SsaEditReport, SsaEditScope,
+    SsaEditor, SsaFunction, SsaFunctionBuilder, SsaRollbackPolicy, TrivialPhiOptions,
+};
 pub use instruction::SsaInstruction;
 pub use ops::{
     BinaryOpInfo, BinaryOpKind, CmpKind, FlagCondition, FlagsMask, SsaOp, UnaryOpInfo, UnaryOpKind,

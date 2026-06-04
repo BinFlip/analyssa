@@ -70,7 +70,199 @@ pub enum SymbolicExpr<T: Target> {
     },
 }
 
+const MAX_RECURSIVE_EXPR_DEPTH: usize = 512;
+
+enum CloneTask<'a, T: Target> {
+    Visit(&'a SymbolicExpr<T>),
+    BuildUnary(SymbolicOp),
+    BuildBinary(SymbolicOp),
+}
+
+enum EvalTask<'a, T: Target> {
+    Visit(&'a SymbolicExpr<T>),
+    EvalUnary(SymbolicOp),
+    EvalBinary(SymbolicOp),
+}
+
+enum SubstituteTask<'a, T: Target> {
+    Visit(&'a SymbolicExpr<T>),
+    BuildUnary(SymbolicOp),
+    BuildBinary(SymbolicOp),
+}
+
 impl<T: Target> SymbolicExpr<T> {
+    fn clone_iterative(&self) -> Self {
+        let mut tasks = vec![CloneTask::Visit(self)];
+        let mut values = Vec::new();
+
+        while let Some(task) = tasks.pop() {
+            match task {
+                CloneTask::Visit(Self::Constant(value)) => {
+                    values.push(Self::Constant(value.clone()));
+                }
+                CloneTask::Visit(Self::Variable(var)) => {
+                    values.push(Self::Variable(*var));
+                }
+                CloneTask::Visit(Self::NamedVar(name)) => {
+                    values.push(Self::NamedVar(name.clone()));
+                }
+                CloneTask::Visit(Self::Unary { op, operand }) => {
+                    tasks.push(CloneTask::BuildUnary(*op));
+                    tasks.push(CloneTask::Visit(operand));
+                }
+                CloneTask::Visit(Self::Binary { op, left, right }) => {
+                    tasks.push(CloneTask::BuildBinary(*op));
+                    tasks.push(CloneTask::Visit(right));
+                    tasks.push(CloneTask::Visit(left));
+                }
+                CloneTask::BuildUnary(op) => {
+                    let Some(operand) = values.pop() else {
+                        return Self::NamedVar("invalid-symbolic-expression".to_string());
+                    };
+                    values.push(Self::Unary {
+                        op,
+                        operand: Box::new(operand),
+                    });
+                }
+                CloneTask::BuildBinary(op) => {
+                    let Some(right) = values.pop() else {
+                        return Self::NamedVar("invalid-symbolic-expression".to_string());
+                    };
+                    let Some(left) = values.pop() else {
+                        return Self::NamedVar("invalid-symbolic-expression".to_string());
+                    };
+                    values.push(Self::Binary {
+                        op,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    });
+                }
+            }
+        }
+
+        values
+            .pop()
+            .unwrap_or_else(|| Self::NamedVar("invalid-symbolic-expression".to_string()))
+    }
+
+    fn substitute_var_iterative(&self, var: SsaVarId, replacement: &Self) -> Self {
+        let mut tasks = vec![SubstituteTask::Visit(self)];
+        let mut values = Vec::new();
+
+        while let Some(task) = tasks.pop() {
+            match task {
+                SubstituteTask::Visit(Self::Constant(value)) => {
+                    values.push(Self::Constant(value.clone()));
+                }
+                SubstituteTask::Visit(Self::Variable(v)) if *v == var => {
+                    values.push(replacement.clone_iterative());
+                }
+                SubstituteTask::Visit(Self::Variable(v)) => {
+                    values.push(Self::Variable(*v));
+                }
+                SubstituteTask::Visit(Self::NamedVar(name)) => {
+                    values.push(Self::NamedVar(name.clone()));
+                }
+                SubstituteTask::Visit(Self::Unary { op, operand }) => {
+                    tasks.push(SubstituteTask::BuildUnary(*op));
+                    tasks.push(SubstituteTask::Visit(operand));
+                }
+                SubstituteTask::Visit(Self::Binary { op, left, right }) => {
+                    tasks.push(SubstituteTask::BuildBinary(*op));
+                    tasks.push(SubstituteTask::Visit(right));
+                    tasks.push(SubstituteTask::Visit(left));
+                }
+                SubstituteTask::BuildUnary(op) => {
+                    let Some(operand) = values.pop() else {
+                        return Self::NamedVar("invalid-symbolic-expression".to_string());
+                    };
+                    values.push(Self::Unary {
+                        op,
+                        operand: Box::new(operand),
+                    });
+                }
+                SubstituteTask::BuildBinary(op) => {
+                    let Some(right) = values.pop() else {
+                        return Self::NamedVar("invalid-symbolic-expression".to_string());
+                    };
+                    let Some(left) = values.pop() else {
+                        return Self::NamedVar("invalid-symbolic-expression".to_string());
+                    };
+                    values.push(Self::Binary {
+                        op,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    });
+                }
+            }
+        }
+
+        values
+            .pop()
+            .unwrap_or_else(|| Self::NamedVar("invalid-symbolic-expression".to_string()))
+    }
+
+    fn substitute_named_iterative(&self, name: &str, replacement: &Self) -> Self {
+        let mut tasks = vec![SubstituteTask::Visit(self)];
+        let mut values = Vec::new();
+
+        while let Some(task) = tasks.pop() {
+            match task {
+                SubstituteTask::Visit(Self::Constant(value)) => {
+                    values.push(Self::Constant(value.clone()));
+                }
+                SubstituteTask::Visit(Self::Variable(v)) => {
+                    values.push(Self::Variable(*v));
+                }
+                SubstituteTask::Visit(Self::NamedVar(n)) if n == name => {
+                    values.push(replacement.clone_iterative());
+                }
+                SubstituteTask::Visit(Self::NamedVar(n)) => {
+                    values.push(Self::NamedVar(n.clone()));
+                }
+                SubstituteTask::Visit(Self::Unary { op, operand }) => {
+                    tasks.push(SubstituteTask::BuildUnary(*op));
+                    tasks.push(SubstituteTask::Visit(operand));
+                }
+                SubstituteTask::Visit(Self::Binary { op, left, right }) => {
+                    tasks.push(SubstituteTask::BuildBinary(*op));
+                    tasks.push(SubstituteTask::Visit(right));
+                    tasks.push(SubstituteTask::Visit(left));
+                }
+                SubstituteTask::BuildUnary(op) => {
+                    let Some(operand) = values.pop() else {
+                        return Self::NamedVar("invalid-symbolic-expression".to_string());
+                    };
+                    values.push(Self::Unary {
+                        op,
+                        operand: Box::new(operand),
+                    });
+                }
+                SubstituteTask::BuildBinary(op) => {
+                    let Some(right) = values.pop() else {
+                        return Self::NamedVar("invalid-symbolic-expression".to_string());
+                    };
+                    let Some(left) = values.pop() else {
+                        return Self::NamedVar("invalid-symbolic-expression".to_string());
+                    };
+                    values.push(Self::Binary {
+                        op,
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    });
+                }
+            }
+        }
+
+        values
+            .pop()
+            .unwrap_or_else(|| Self::NamedVar("invalid-symbolic-expression".to_string()))
+    }
+
+    pub(crate) fn reaches_recursive_depth_limit(&self) -> bool {
+        self.depth() >= MAX_RECURSIVE_EXPR_DEPTH
+    }
+
     /// Creates a constant expression from a typed `ConstValue`.
     ///
     /// This is the preferred constructor as it preserves type information.
@@ -250,6 +442,27 @@ impl<T: Target> SymbolicExpr<T> {
         }
     }
 
+    /// Calls `f` for every SSA variable referenced in this expression.
+    ///
+    /// Traverses the expression tree iteratively without allocating a set, so
+    /// callers that only need to visit (or collect with their own dedup
+    /// strategy) the variables avoid the cost of [`variables`](Self::variables).
+    /// The same variable may be reported more than once.
+    pub fn for_each_variable<F: FnMut(SsaVarId)>(&self, mut f: F) {
+        let mut stack = vec![self];
+        while let Some(expr) = stack.pop() {
+            match expr {
+                Self::Constant(_) | Self::NamedVar(_) => {}
+                Self::Variable(v) => f(*v),
+                Self::Unary { operand, .. } => stack.push(operand),
+                Self::Binary { left, right, .. } => {
+                    stack.push(right);
+                    stack.push(left);
+                }
+            }
+        }
+    }
+
     /// Collects all SSA variables referenced in this expression.
     ///
     /// Recursively traverses the expression tree to find all variable references.
@@ -259,25 +472,30 @@ impl<T: Target> SymbolicExpr<T> {
     /// A set of all [`SsaVarId`]s referenced in this expression.
     #[must_use]
     pub fn variables(&self) -> HashSet<SsaVarId> {
-        match self {
-            Self::Constant(_) | Self::NamedVar(_) => HashSet::new(),
-            Self::Variable(v) => {
-                let mut vars = HashSet::new();
-                vars.insert(*v);
-                vars
-            }
-            Self::Unary { operand, .. } => operand.variables(),
-            Self::Binary { left, right, .. } => {
-                let mut vars = left.variables();
-                vars.extend(right.variables());
-                vars
+        let mut vars = HashSet::new();
+        let mut stack = vec![self];
+
+        while let Some(expr) = stack.pop() {
+            match expr {
+                Self::Constant(_) | Self::NamedVar(_) => {}
+                Self::Variable(v) => {
+                    vars.insert(*v);
+                }
+                Self::Unary { operand, .. } => stack.push(operand),
+                Self::Binary { left, right, .. } => {
+                    stack.push(right);
+                    stack.push(left);
+                }
             }
         }
+
+        vars
     }
 
     /// Collects all named variables referenced in this expression.
     ///
-    /// Recursively traverses the expression tree to find all named variable references.
+    /// Traverses the expression tree iteratively to avoid consuming call stack
+    /// on adversarially deep symbolic expressions.
     ///
     /// # Returns
     ///
@@ -285,34 +503,30 @@ impl<T: Target> SymbolicExpr<T> {
     #[must_use]
     pub fn named_variables(&self) -> HashSet<String> {
         let mut vars = HashSet::new();
-        self.collect_named_variables(&mut vars);
-        vars
-    }
+        let mut stack = vec![self];
 
-    /// Recursively collects named variables into the provided set.
-    ///
-    /// # Arguments
-    ///
-    /// * `vars` - The set to collect variable names into.
-    fn collect_named_variables(&self, vars: &mut HashSet<String>) {
-        match self {
-            Self::Constant(_) | Self::Variable(_) => {}
-            Self::NamedVar(name) => {
-                vars.insert(name.clone());
-            }
-            Self::Unary { operand, .. } => operand.collect_named_variables(vars),
-            Self::Binary { left, right, .. } => {
-                left.collect_named_variables(vars);
-                right.collect_named_variables(vars);
+        while let Some(expr) = stack.pop() {
+            match expr {
+                Self::Constant(_) | Self::Variable(_) => {}
+                Self::NamedVar(name) => {
+                    vars.insert(name.clone());
+                }
+                Self::Unary { operand, .. } => stack.push(operand),
+                Self::Binary { left, right, .. } => {
+                    stack.push(right);
+                    stack.push(left);
+                }
             }
         }
+
+        vars
     }
 
     /// Evaluates the expression with the given SSA variable bindings.
     ///
-    /// Recursively evaluates the expression tree, substituting bound variables
-    /// with their values and computing operations. Returns the result as a
-    /// typed `ConstValue`.
+    /// Iteratively evaluates the expression tree in post-order, substituting
+    /// bound variables with their values and computing operations. Returns the
+    /// result as a typed `ConstValue`.
     ///
     /// # Arguments
     ///
@@ -329,20 +543,36 @@ impl<T: Target> SymbolicExpr<T> {
         bindings: &HashMap<SsaVarId, ConstValue<T>>,
         ptr_size: PointerSize,
     ) -> Option<ConstValue<T>> {
-        match self {
-            Self::Constant(v) => Some(v.clone()),
-            Self::Variable(var) => bindings.get(var).cloned(),
-            Self::NamedVar(_) => None,
-            Self::Unary { op, operand } => {
-                let v = operand.evaluate(bindings, ptr_size)?;
-                evaluate_unary_typed(*op, &v, ptr_size)
-            }
-            Self::Binary { op, left, right } => {
-                let l = left.evaluate(bindings, ptr_size)?;
-                let r = right.evaluate(bindings, ptr_size)?;
-                evaluate_binary_typed(*op, &l, &r, ptr_size)
+        let mut tasks = vec![EvalTask::Visit(self)];
+        let mut values: Vec<Option<ConstValue<T>>> = Vec::new();
+
+        while let Some(task) = tasks.pop() {
+            match task {
+                EvalTask::Visit(Self::Constant(value)) => values.push(Some(value.clone())),
+                EvalTask::Visit(Self::Variable(var)) => values.push(bindings.get(var).cloned()),
+                EvalTask::Visit(Self::NamedVar(_)) => values.push(None),
+                EvalTask::Visit(Self::Unary { op, operand }) => {
+                    tasks.push(EvalTask::EvalUnary(*op));
+                    tasks.push(EvalTask::Visit(operand));
+                }
+                EvalTask::Visit(Self::Binary { op, left, right }) => {
+                    tasks.push(EvalTask::EvalBinary(*op));
+                    tasks.push(EvalTask::Visit(right));
+                    tasks.push(EvalTask::Visit(left));
+                }
+                EvalTask::EvalUnary(op) => {
+                    let value = values.pop()??;
+                    values.push(evaluate_unary_typed(op, &value, ptr_size));
+                }
+                EvalTask::EvalBinary(op) => {
+                    let right = values.pop()??;
+                    let left = values.pop()??;
+                    values.push(evaluate_binary_typed(op, &left, &right, ptr_size));
+                }
             }
         }
+
+        values.pop().flatten()
     }
 
     /// Evaluates the expression with named variable bindings.
@@ -365,20 +595,38 @@ impl<T: Target> SymbolicExpr<T> {
         bindings: &HashMap<&str, ConstValue<T>>,
         ptr_size: PointerSize,
     ) -> Option<ConstValue<T>> {
-        match self {
-            Self::Constant(v) => Some(v.clone()),
-            Self::Variable(_) => None,
-            Self::NamedVar(name) => bindings.get(name.as_str()).cloned(),
-            Self::Unary { op, operand } => {
-                let v = operand.evaluate_named(bindings, ptr_size)?;
-                evaluate_unary_typed(*op, &v, ptr_size)
-            }
-            Self::Binary { op, left, right } => {
-                let l = left.evaluate_named(bindings, ptr_size)?;
-                let r = right.evaluate_named(bindings, ptr_size)?;
-                evaluate_binary_typed(*op, &l, &r, ptr_size)
+        let mut tasks = vec![EvalTask::Visit(self)];
+        let mut values: Vec<Option<ConstValue<T>>> = Vec::new();
+
+        while let Some(task) = tasks.pop() {
+            match task {
+                EvalTask::Visit(Self::Constant(value)) => values.push(Some(value.clone())),
+                EvalTask::Visit(Self::Variable(_)) => values.push(None),
+                EvalTask::Visit(Self::NamedVar(name)) => {
+                    values.push(bindings.get(name.as_str()).cloned());
+                }
+                EvalTask::Visit(Self::Unary { op, operand }) => {
+                    tasks.push(EvalTask::EvalUnary(*op));
+                    tasks.push(EvalTask::Visit(operand));
+                }
+                EvalTask::Visit(Self::Binary { op, left, right }) => {
+                    tasks.push(EvalTask::EvalBinary(*op));
+                    tasks.push(EvalTask::Visit(right));
+                    tasks.push(EvalTask::Visit(left));
+                }
+                EvalTask::EvalUnary(op) => {
+                    let value = values.pop()??;
+                    values.push(evaluate_unary_typed(op, &value, ptr_size));
+                }
+                EvalTask::EvalBinary(op) => {
+                    let right = values.pop()??;
+                    let left = values.pop()??;
+                    values.push(evaluate_binary_typed(op, &left, &right, ptr_size));
+                }
             }
         }
+
+        values.pop().flatten()
     }
 
     /// Substitutes an SSA variable with a replacement expression.
@@ -396,21 +644,7 @@ impl<T: Target> SymbolicExpr<T> {
     /// A new expression with the substitution applied.
     #[must_use]
     pub fn substitute(&self, var: SsaVarId, replacement: &Self) -> Self {
-        match self {
-            Self::Constant(v) => Self::Constant(v.clone()),
-            Self::Variable(v) if *v == var => replacement.clone(),
-            Self::Variable(v) => Self::Variable(*v),
-            Self::NamedVar(name) => Self::NamedVar(name.clone()),
-            Self::Unary { op, operand } => Self::Unary {
-                op: *op,
-                operand: Box::new(operand.substitute(var, replacement)),
-            },
-            Self::Binary { op, left, right } => Self::Binary {
-                op: *op,
-                left: Box::new(left.substitute(var, replacement)),
-                right: Box::new(right.substitute(var, replacement)),
-            },
-        }
+        self.substitute_var_iterative(var, replacement)
     }
 
     /// Substitutes a named variable with a constant value.
@@ -459,21 +693,7 @@ impl<T: Target> SymbolicExpr<T> {
     /// A new expression with the substitution applied.
     #[must_use]
     pub fn substitute_named_expr(&self, name: &str, replacement: &Self) -> Self {
-        match self {
-            Self::Constant(v) => Self::Constant(v.clone()),
-            Self::Variable(v) => Self::Variable(*v),
-            Self::NamedVar(n) if n == name => replacement.clone(),
-            Self::NamedVar(n) => Self::NamedVar(n.clone()),
-            Self::Unary { op, operand } => Self::Unary {
-                op: *op,
-                operand: Box::new(operand.substitute_named_expr(name, replacement)),
-            },
-            Self::Binary { op, left, right } => Self::Binary {
-                op: *op,
-                left: Box::new(left.substitute_named_expr(name, replacement)),
-                right: Box::new(right.substitute_named_expr(name, replacement)),
-            },
-        }
+        self.substitute_named_iterative(name, replacement)
     }
 
     /// Simplifies the expression by evaluating constant subexpressions.
@@ -492,8 +712,12 @@ impl<T: Target> SymbolicExpr<T> {
     #[must_use]
     #[allow(clippy::match_same_arms)] // Documents distinct algebraic identities: x*0=0 vs x&0=0
     pub fn simplify(&self, ptr_size: PointerSize) -> Self {
+        if self.depth() > MAX_RECURSIVE_EXPR_DEPTH {
+            return self.clone_iterative();
+        }
+
         match self {
-            Self::Constant(_) | Self::Variable(_) | Self::NamedVar(_) => self.clone(),
+            Self::Constant(_) | Self::Variable(_) | Self::NamedVar(_) => self.clone_iterative(),
             Self::Unary { op, operand } => {
                 let simplified = operand.simplify(ptr_size);
 
@@ -513,9 +737,9 @@ impl<T: Target> SymbolicExpr<T> {
                     if op == inner_op {
                         match op {
                             // --x = x (double negation)
-                            SymbolicOp::Neg => return (**inner_operand).clone(),
+                            SymbolicOp::Neg => return inner_operand.clone_iterative(),
                             // ~~x = x (double NOT)
-                            SymbolicOp::Not => return (**inner_operand).clone(),
+                            SymbolicOp::Not => return inner_operand.clone_iterative(),
                             _ => {}
                         }
                     }
@@ -702,13 +926,25 @@ impl<T: Target> SymbolicExpr<T> {
     /// The maximum nesting depth of operations in this expression.
     #[must_use]
     pub fn depth(&self) -> usize {
-        match self {
-            Self::Constant(_) | Self::Variable(_) | Self::NamedVar(_) => 0,
-            Self::Unary { operand, .. } => 1usize.saturating_add(operand.depth()),
-            Self::Binary { left, right, .. } => {
-                1usize.saturating_add(left.depth().max(right.depth()))
+        let mut max_depth = 0usize;
+        let mut stack = vec![(self, 0usize)];
+
+        while let Some((expr, depth)) = stack.pop() {
+            max_depth = max_depth.max(depth);
+            match expr {
+                Self::Constant(_) | Self::Variable(_) | Self::NamedVar(_) => {}
+                Self::Unary { operand, .. } => {
+                    stack.push((operand, depth.saturating_add(1)));
+                }
+                Self::Binary { left, right, .. } => {
+                    let child_depth = depth.saturating_add(1);
+                    stack.push((right, child_depth));
+                    stack.push((left, child_depth));
+                }
             }
         }
+
+        max_depth
     }
 }
 
@@ -719,6 +955,11 @@ where
     T::FieldRef: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let depth = self.depth();
+        if depth > MAX_RECURSIVE_EXPR_DEPTH {
+            return write!(f, "<symbolic-expr depth {depth}>");
+        }
+
         match self {
             Self::Constant(v) => write!(f, "{v}"),
             Self::Variable(var) => write!(f, "v{}", var.index()),
@@ -871,5 +1112,57 @@ pub fn evaluate_binary_typed<T: Target>(
         | SymbolicOp::BitScanReverse
         | SymbolicOp::Popcount
         | SymbolicOp::Parity => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::{
+        analysis::symbolic::{expr::SymbolicExpr, ops::SymbolicOp},
+        ir::{value::ConstValue, variable::SsaVarId},
+        testing::MockTarget,
+        PointerSize,
+    };
+
+    fn deep_named_add_chain(depth: usize) -> SymbolicExpr<MockTarget> {
+        let mut expr = SymbolicExpr::named("state");
+        for _ in 0..depth {
+            expr = SymbolicExpr::binary(SymbolicOp::Add, expr, SymbolicExpr::constant_i32(0));
+        }
+        expr
+    }
+
+    #[test]
+    fn deep_expression_queries_do_not_recurse_on_call_stack() {
+        let expr = deep_named_add_chain(1_024);
+
+        assert_eq!(expr.depth(), 1_024);
+        assert!(expr.named_variables().contains("state"));
+        assert!(expr.variables().is_empty());
+        assert_eq!(format!("{expr}"), "<symbolic-expr depth 1024>");
+    }
+
+    #[test]
+    fn deep_expression_substitution_and_evaluation_are_iterative() {
+        let expr = deep_named_add_chain(1_024);
+        let substituted = expr.substitute_named_expr("state", &SymbolicExpr::constant_i32(7));
+
+        assert_eq!(
+            substituted.evaluate(
+                &HashMap::<SsaVarId, ConstValue<MockTarget>>::new(),
+                PointerSize::Bit64
+            ),
+            Some(ConstValue::I32(7))
+        );
+    }
+
+    #[test]
+    fn deep_expression_simplify_returns_without_recursive_descent() {
+        let expr = deep_named_add_chain(1_024);
+        let simplified = expr.simplify(PointerSize::Bit64);
+
+        assert_eq!(simplified.depth(), 1_024);
     }
 }

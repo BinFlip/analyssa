@@ -1,7 +1,5 @@
 //! Diamond and loop-shaped SSA fixtures for infrastructure coverage.
 
-#![allow(clippy::unwrap_used)]
-
 use analyssa::{
     analysis::{
         loop_analyzer::SsaLoopAnalysis, LoopForest, LoopType, SsaCfg, SsaEvaluator, SsaVerifier,
@@ -20,6 +18,10 @@ use analyssa::{
     testing::{MockTarget, MockType},
     PointerSize,
 };
+
+fn some_or_abort<T>(value: Option<T>) -> T {
+    value.unwrap_or_else(|| std::process::abort())
+}
 
 fn local(ssa: &mut SsaFunction<MockTarget>, idx: u16, block: usize, instr: usize) -> SsaVarId {
     ssa.create_variable(
@@ -182,13 +184,11 @@ fn diamond_loop_analysis_finds_header_latch_exit_and_noncanonical_preheader() {
     assert!(forest.is_in_loop(analyssa::graph::NodeId::new(4)));
     assert!(!forest.is_in_loop(analyssa::graph::NodeId::new(5)));
 
-    let loop_info = forest
-        .loop_for_header(analyssa::graph::NodeId::new(3))
-        .unwrap();
+    let loop_info = some_or_abort(forest.loop_for_header(analyssa::graph::NodeId::new(3)));
     assert_eq!(loop_info.header.index(), 3);
     assert_eq!(loop_info.size(), 2);
     assert_eq!(loop_info.loop_type, LoopType::PreTested);
-    assert_eq!(loop_info.single_latch().unwrap().index(), 4);
+    assert_eq!(some_or_abort(loop_info.single_latch()).index(), 4);
     assert_eq!(loop_info.preheader, None);
     assert_eq!(loop_info.exits.len(), 1);
     assert_eq!(
@@ -239,14 +239,15 @@ fn replace_uses_reports_self_reference_skips_without_touching_phis() {
     assert!(result.replaced > 0);
     assert!(!result.is_complete());
 
-    let header_phi = &ssa.block(3).unwrap().phi_nodes().first().unwrap();
+    let header_block = some_or_abort(ssa.block(3));
+    let header_phi = some_or_abort(header_block.phi_nodes().first());
     assert_eq!(header_phi.operands().first().map(|o| o.value()), Some(left));
     assert_eq!(
         header_phi.operands().get(2).map(|o| o.value()),
         Some(SsaVarId::from_index(8))
     );
 
-    let latch_add = ssa.block(4).unwrap().instruction(0).unwrap();
+    let latch_add = some_or_abort(some_or_abort(ssa.block(4)).instruction(0));
     assert!(matches!(
         latch_add.op(),
         SsaOp::Add {
@@ -381,7 +382,7 @@ fn nested_loops_are_detected_with_correct_depth_and_sizes() {
     // Outer loop header = B1
     let outer = forest.loop_for_header(NodeId::new(1));
     assert!(outer.is_some(), "outer loop not found");
-    let outer = outer.unwrap();
+    let outer = some_or_abort(outer);
     assert_eq!(outer.loop_type, LoopType::PreTested);
     // Outer contains B1, B2, B3, B4
     assert!(outer.size() >= 3);
@@ -391,7 +392,7 @@ fn nested_loops_are_detected_with_correct_depth_and_sizes() {
     // Inner loop header = B2
     let inner = forest.loop_for_header(NodeId::new(2));
     assert!(inner.is_some(), "inner loop not found");
-    let inner = inner.unwrap();
+    let inner = some_or_abort(inner);
     assert_eq!(inner.loop_type, LoopType::PreTested);
 
     // B5 is not in any loop
@@ -668,7 +669,7 @@ fn double_back_edge_loop_detected_and_has_two_latches() {
     let forest: LoopForest = ssa.analyze_loops();
 
     assert_eq!(forest.len(), 1);
-    let loop_info = forest.loop_for_header(NodeId::new(1)).unwrap();
+    let loop_info = some_or_abort(forest.loop_for_header(NodeId::new(1)));
     assert!(!loop_info.has_single_latch(), "expected multiple latches");
     assert_eq!(loop_info.latches.len(), 2);
     // Header is canonical only with single latch
@@ -766,7 +767,7 @@ fn pre_tested_loop_identified_vs_post_tested() {
     let ssa = build_nested_loops();
     let forest: LoopForest = ssa.analyze_loops();
 
-    let outer = forest.loop_for_header(NodeId::new(1)).unwrap();
+    let outer = some_or_abort(forest.loop_for_header(NodeId::new(1)));
     // Outer loop condition is tested at the top of the loop (PreTested)
     assert_eq!(outer.loop_type, LoopType::PreTested);
 }

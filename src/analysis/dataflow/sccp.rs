@@ -77,8 +77,8 @@ use crate::{
     bitset::BitSet,
     graph::{NodeId, RootedGraph, Successors},
     ir::{
-        block::SsaBlock, function::SsaFunction, ops::SsaOp, phi::PhiNode, value::ConstValue,
-        variable::SsaVarId,
+        block::SsaBlock, function::SsaFunction, instruction::SsaInstruction, ops::SsaOp,
+        phi::PhiNode, value::ConstValue, variable::SsaVarId,
     },
     pointer::PointerSize,
     target::Target,
@@ -157,8 +157,8 @@ impl<T: Target> ConstantPropagation<T> {
         self.propagate(ssa, cfg);
 
         SccpResult {
-            values: self.values.clone(),
-            executable_blocks: self.executable_blocks.clone(),
+            values: std::mem::take(&mut self.values),
+            executable_blocks: std::mem::take(&mut self.executable_blocks),
         }
     }
 
@@ -293,10 +293,7 @@ impl<T: Target> ConstantPropagation<T> {
     /// variables defined by the instruction.
     fn process_block_definitions(&mut self, block: &SsaBlock<T>) {
         for instr in block.instructions() {
-            if let Some(def) = instr.def() {
-                let value = self.evaluate_instruction(instr.op());
-                self.update_value(def, &value);
-            }
+            self.update_instruction_defs(instr);
         }
     }
 
@@ -327,10 +324,7 @@ impl<T: Target> ConstantPropagation<T> {
                     // Re-evaluate the instruction
                     if let Some(block) = ssa.block(block_id) {
                         if let Some(instr) = block.instruction(use_site.instruction) {
-                            if let Some(def) = instr.def() {
-                                let value = self.evaluate_instruction(instr.op());
-                                self.update_value(def, &value);
-                            }
+                            self.update_instruction_defs(instr);
 
                             // Check if this is a branch instruction
                             if instr.is_terminator() {
@@ -539,6 +533,19 @@ impl<T: Target> ConstantPropagation<T> {
             // the result is still unknown (Top), not varying (Bottom).
             None if saw_top => ScalarValue::Top,
             None => ScalarValue::Bottom,
+        }
+    }
+
+    /// Updates all definitions produced by an instruction.
+    fn update_instruction_defs(&mut self, instr: &SsaInstruction<T>) {
+        let primary = instr.op().dest();
+        let value = self.evaluate_instruction(instr.op());
+        for def in instr.defs() {
+            if Some(def) == primary {
+                self.update_value(def, &value);
+            } else {
+                self.update_value(def, &ScalarValue::Bottom);
+            }
         }
     }
 

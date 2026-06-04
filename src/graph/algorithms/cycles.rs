@@ -86,40 +86,71 @@ pub fn has_cycle<G: Successors>(graph: &G, start: NodeId) -> bool {
     has_cycle_dfs(graph, start, &mut visited, &mut in_stack)
 }
 
-/// Recursive helper for cycle detection.
+/// Iterative helper for cycle detection.
+///
+/// Uses an explicit work stack (one frame per gray node, carrying that node's
+/// remaining successors) rather than call-stack recursion, so it cannot
+/// overflow the stack on deep or long-chain graphs.
 fn has_cycle_dfs<G: Successors>(
     graph: &G,
-    node: NodeId,
+    start: NodeId,
     visited: &mut [bool],
     in_stack: &mut [bool],
 ) -> bool {
-    let idx = node.index();
-
-    if in_stack.get(idx).copied().unwrap_or(false) {
-        // Found a back edge - cycle detected
-        return true;
-    }
-
-    if visited.get(idx).copied().unwrap_or(false) {
-        // Already processed this node in a different path, no cycle here
+    let start_idx = start.index();
+    if visited.get(start_idx).copied().unwrap_or(false) {
         return false;
     }
-
-    if let Some(slot) = visited.get_mut(idx) {
+    if let Some(slot) = visited.get_mut(start_idx) {
         *slot = true;
     }
-    if let Some(slot) = in_stack.get_mut(idx) {
+    if let Some(slot) = in_stack.get_mut(start_idx) {
         *slot = true;
     }
 
-    for successor in graph.successors(node) {
-        if has_cycle_dfs(graph, successor, visited, in_stack) {
-            return true;
+    // Each frame is a gray node and an iterator over its not-yet-visited
+    // successors. The successor type is opaque, so it is materialized into a
+    // `Vec` per frame.
+    let mut stack: Vec<(NodeId, std::vec::IntoIter<NodeId>)> = vec![(
+        start,
+        graph.successors(start).collect::<Vec<_>>().into_iter(),
+    )];
+
+    while !stack.is_empty() {
+        let next = match stack.last_mut() {
+            Some(frame) => frame.1.next(),
+            None => break,
+        };
+        match next {
+            Some(successor) => {
+                let s_idx = successor.index();
+                if in_stack.get(s_idx).copied().unwrap_or(false) {
+                    // Back edge to a node on the current path - cycle detected.
+                    return true;
+                }
+                if visited.get(s_idx).copied().unwrap_or(false) {
+                    continue;
+                }
+                if let Some(slot) = visited.get_mut(s_idx) {
+                    *slot = true;
+                }
+                if let Some(slot) = in_stack.get_mut(s_idx) {
+                    *slot = true;
+                }
+                stack.push((
+                    successor,
+                    graph.successors(successor).collect::<Vec<_>>().into_iter(),
+                ));
+            }
+            None => {
+                // Successors exhausted: leave the node (back to black).
+                if let Some((node, _)) = stack.pop() {
+                    if let Some(slot) = in_stack.get_mut(node.index()) {
+                        *slot = false;
+                    }
+                }
+            }
         }
-    }
-
-    if let Some(slot) = in_stack.get_mut(idx) {
-        *slot = false;
     }
     false
 }
@@ -178,45 +209,74 @@ pub fn find_cycle<G: Successors>(graph: &G, start: NodeId) -> Option<Vec<NodeId>
     find_cycle_dfs(graph, start, &mut visited, &mut in_stack, &mut path)
 }
 
-/// Recursive helper for finding a cycle.
+/// Iterative helper for finding a cycle.
+///
+/// Like [`has_cycle_dfs`], this uses an explicit work stack instead of
+/// recursion. `path` mirrors the gray nodes on the current DFS path, so a back
+/// edge can be reconstructed into a closed cycle.
 fn find_cycle_dfs<G: Successors>(
     graph: &G,
-    node: NodeId,
+    start: NodeId,
     visited: &mut [bool],
     in_stack: &mut [bool],
     path: &mut Vec<NodeId>,
 ) -> Option<Vec<NodeId>> {
-    let idx = node.index();
-
-    if in_stack.get(idx).copied().unwrap_or(false) {
-        // Found a back edge - extract the cycle
-        let cycle_start_pos = path.iter().position(|&n| n == node)?;
-        let mut cycle: Vec<NodeId> = path.get(cycle_start_pos..)?.to_vec();
-        cycle.push(node); // Close the cycle
-        return Some(cycle);
-    }
-
-    if visited.get(idx).copied().unwrap_or(false) {
+    let start_idx = start.index();
+    if visited.get(start_idx).copied().unwrap_or(false) {
         return None;
     }
-
-    if let Some(slot) = visited.get_mut(idx) {
+    if let Some(slot) = visited.get_mut(start_idx) {
         *slot = true;
     }
-    if let Some(slot) = in_stack.get_mut(idx) {
+    if let Some(slot) = in_stack.get_mut(start_idx) {
         *slot = true;
     }
-    path.push(node);
+    path.push(start);
 
-    for successor in graph.successors(node) {
-        if let Some(cycle) = find_cycle_dfs(graph, successor, visited, in_stack, path) {
-            return Some(cycle);
+    let mut stack: Vec<(NodeId, std::vec::IntoIter<NodeId>)> = vec![(
+        start,
+        graph.successors(start).collect::<Vec<_>>().into_iter(),
+    )];
+
+    while !stack.is_empty() {
+        let next = match stack.last_mut() {
+            Some(frame) => frame.1.next(),
+            None => break,
+        };
+        match next {
+            Some(successor) => {
+                let s_idx = successor.index();
+                if in_stack.get(s_idx).copied().unwrap_or(false) {
+                    // Back edge - extract the cycle from `path`.
+                    let cycle_start_pos = path.iter().position(|&n| n == successor)?;
+                    let mut cycle: Vec<NodeId> = path.get(cycle_start_pos..)?.to_vec();
+                    cycle.push(successor); // Close the cycle.
+                    return Some(cycle);
+                }
+                if visited.get(s_idx).copied().unwrap_or(false) {
+                    continue;
+                }
+                if let Some(slot) = visited.get_mut(s_idx) {
+                    *slot = true;
+                }
+                if let Some(slot) = in_stack.get_mut(s_idx) {
+                    *slot = true;
+                }
+                path.push(successor);
+                stack.push((
+                    successor,
+                    graph.successors(successor).collect::<Vec<_>>().into_iter(),
+                ));
+            }
+            None => {
+                if let Some((node, _)) = stack.pop() {
+                    if let Some(slot) = in_stack.get_mut(node.index()) {
+                        *slot = false;
+                    }
+                    path.pop();
+                }
+            }
         }
-    }
-
-    path.pop();
-    if let Some(slot) = in_stack.get_mut(idx) {
-        *slot = false;
     }
     None
 }
@@ -415,6 +475,30 @@ mod tests {
                 next
             );
         }
+    }
+
+    #[test]
+    fn test_has_cycle_deep_linear_chain_is_iterative() {
+        // A long acyclic chain would overflow a recursive DFS; the iterative
+        // implementation must handle it without blowing the stack.
+        let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
+        let mut nodes = Vec::new();
+        for _ in 0..10_000 {
+            nodes.push(graph.add_node(()));
+        }
+        for window in nodes.windows(2) {
+            graph.add_edge(window[0], window[1], ()).unwrap();
+        }
+        assert!(!has_cycle(&graph, nodes[0]));
+        assert!(find_cycle(&graph, nodes[0]).is_none());
+
+        // Closing the chain into a giant cycle must still be detected.
+        graph
+            .add_edge(nodes[nodes.len() - 1], nodes[0], ())
+            .unwrap();
+        assert!(has_cycle(&graph, nodes[0]));
+        let cycle = find_cycle(&graph, nodes[0]).unwrap();
+        assert_eq!(cycle.first(), cycle.last());
     }
 
     #[test]

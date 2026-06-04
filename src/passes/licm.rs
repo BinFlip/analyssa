@@ -36,7 +36,12 @@ use crate::{
     analysis::{loop_analyzer::LoopAnalyzer, loops::LoopInfo},
     bitset::BitSet,
     events::{EventKind, EventListener},
-    ir::{function::SsaFunction, instruction::SsaInstruction, ops::SsaOp, variable::SsaVarId},
+    ir::{
+        function::{SsaEditOptions, SsaFunction, SsaRollbackPolicy},
+        instruction::SsaInstruction,
+        ops::SsaOp,
+        variable::SsaVarId,
+    },
     target::Target,
 };
 
@@ -77,7 +82,7 @@ where
             .map(|b| {
                 b.instructions()
                     .last()
-                    .map(|i| i.op().successors().contains(&header_idx))
+                    .map(|i| i.op().has_successor(header_idx))
                     .unwrap_or(false)
             })
             .unwrap_or(false);
@@ -98,32 +103,51 @@ where
             continue;
         }
 
+        let phi_back_edge_operands = phi_back_edge_operands(ssa, loop_info);
         let mut hoistable: Vec<_> = invariants
             .into_iter()
-            .filter(|(block_idx, instr_idx)| can_hoist(ssa, loop_info, *block_idx, *instr_idx))
+            .filter(|(block_idx, instr_idx)| {
+                can_hoist(
+                    ssa,
+                    loop_info,
+                    &phi_back_edge_operands,
+                    *block_idx,
+                    *instr_idx,
+                )
+            })
             .collect();
 
-        // Convergent filter: drop instructions whose operands aren't ready
-        // either as outside-loop defs or as defs from other surviving
-        // hoistables.
+        let preheader_idx = preheader.index();
+        let insert_base = if let Some(preheader_block) = ssa.block(preheader_idx) {
+            let instrs = preheader_block.instructions();
+            if instrs.is_empty() {
+                0
+            } else if instrs.last().is_some_and(SsaInstruction::is_terminator) {
+                instrs.len().saturating_sub(1)
+            } else {
+                instrs.len()
+            }
+        } else {
+            0
+        };
+
+        // Convergent filter: drop instructions whose operands are not already
+        // defined outside the loop. Dependent invariants can be hoisted by a
+        // later LICM invocation after their producer has been moved to the
+        // preheader. This avoids inserting a hoisted use before a hoisted def.
         let mut outside_defs = BitSet::new(ssa.var_id_capacity());
         for v in ssa.variables() {
-            if !loop_info.body.contains(v.def_site().block) {
+            let site = v.def_site();
+            let preheader_def_after_insert = site.block == preheader_idx
+                && site
+                    .instruction
+                    .is_some_and(|instr_idx| instr_idx >= insert_base);
+            if !loop_info.body.contains(site.block) && !preheader_def_after_insert {
                 outside_defs.insert(v.id().index());
             }
         }
 
         loop {
-            let mut hoistable_defs = BitSet::new(ssa.var_id_capacity());
-            for (block_idx, instr_idx) in hoistable.iter() {
-                if let Some(def) = ssa
-                    .block(*block_idx)
-                    .and_then(|b| b.instruction(*instr_idx))
-                    .and_then(|i| i.def())
-                {
-                    hoistable_defs.insert(def.index());
-                }
-            }
             let before = hoistable.len();
             hoistable.retain(|(block_idx, instr_idx)| {
                 let Some(block) = ssa.block(*block_idx) else {
@@ -132,10 +156,23 @@ where
                 let Some(instr) = block.instruction(*instr_idx) else {
                     return false;
                 };
-                instr.op().uses().iter().all(|operand| {
-                    outside_defs.contains(operand.index())
-                        || hoistable_defs.contains(operand.index())
-                })
+                let def_used_before_insert = instr.op().defs().any(|def| {
+                    ssa.variable(def).is_some_and(|var| {
+                        var.uses().iter().any(|site| {
+                            site.block == preheader_idx
+                                && !site.is_phi_operand
+                                && site.instruction < insert_base
+                        })
+                    })
+                });
+                if def_used_before_insert {
+                    return false;
+                }
+                let mut operands_are_available = true;
+                instr.op().for_each_use(|operand| {
+                    operands_are_available &= outside_defs.contains(operand.index());
+                });
+                operands_are_available
             });
             if hoistable.len() == before {
                 break;
@@ -159,13 +196,13 @@ where
                         .count();
                     if hoist_count >= non_term {
                         if let Some(term) = block.terminator_op() {
-                            for succ in term.successors() {
+                            term.for_each_successor(|succ| {
                                 if let Some(succ_block) = ssa.block(succ) {
                                     if !succ_block.phi_nodes().is_empty() {
                                         trampoline_blocks.insert(block_idx);
                                     }
                                 }
-                            }
+                            });
                         }
                     }
                 }
@@ -191,70 +228,57 @@ where
         // Preserve original definition order so dependencies stay valid.
         to_hoist.sort_by_key(|(block_idx, instr_idx, _)| (*block_idx, *instr_idx));
 
-        // Insert just before the preheader's terminator.
-        let insert_base = if let Some(preheader_block) = ssa.block(preheader.index()) {
-            let instrs = preheader_block.instructions();
-            if instrs.is_empty() {
-                0
-            } else if instrs.last().is_some_and(SsaInstruction::is_terminator) {
-                instrs.len().saturating_sub(1)
-            } else {
-                instrs.len()
-            }
-        } else {
-            0
-        };
+        let mut hoisted_this_loop = 0usize;
+        let result = ssa.edit(
+            SsaEditOptions::new()
+                .with_verify(true)
+                .with_rollback(SsaRollbackPolicy::OnFailure),
+            |editor| {
+                let mut hoisted_from = BitSet::new(editor.function().block_count());
 
-        let mut hoisted_from = BitSet::new(ssa.block_count());
+                for (i, (block_idx, instr_idx, op)) in to_hoist.iter().enumerate() {
+                    hoisted_from.insert(*block_idx);
 
-        for (i, (block_idx, instr_idx, op)) in to_hoist.iter().enumerate() {
-            hoisted_from.insert(*block_idx);
-
-            if let Some(preheader_block) = ssa.block_mut(preheader.index()) {
-                let new_instr = SsaInstruction::synthetic(op.clone());
-                let instrs = preheader_block.instructions_mut();
-                instrs.insert(insert_base.saturating_add(i), new_instr);
-            }
-            if let Some(block) = ssa.block_mut(*block_idx) {
-                if let Some(instr) = block.instructions_mut().get_mut(*instr_idx) {
-                    instr.set_op(SsaOp::Nop);
+                    editor.insert_instruction(
+                        preheader_idx,
+                        insert_base.saturating_add(i),
+                        SsaInstruction::synthetic(op.clone()),
+                    )?;
+                    editor.nop_instruction(*block_idx, *instr_idx)?;
+                    hoisted_this_loop = hoisted_this_loop.saturating_add(1);
                 }
-            }
-            total_hoisted = total_hoisted.saturating_add(1);
-        }
 
-        // If a source block is now a trampoline, redirect successor phis from
-        // the source block to the preheader (where the hoisted defs live).
-        let preheader_idx = preheader.index();
-        for source_block in hoisted_from.iter() {
-            let is_trampoline = ssa.block(source_block).is_some_and(|b| {
-                b.instructions()
-                    .iter()
-                    .all(|i| i.is_terminator() || matches!(i.op(), SsaOp::Nop))
-            });
-            if !is_trampoline {
-                continue;
-            }
-            let successors: Vec<usize> = ssa
-                .block(source_block)
-                .map(|b| {
-                    b.instructions()
-                        .last()
-                        .map(|i| i.op().successors())
-                        .unwrap_or_default()
-                })
-                .unwrap_or_default();
-            for succ in successors {
-                if let Some(succ_block) = ssa.block_mut(succ) {
-                    for phi in succ_block.phi_nodes_mut() {
-                        for operand in phi.operands_mut() {
-                            if operand.predecessor() == source_block {
-                                operand.set_predecessor(preheader_idx);
-                            }
-                        }
+                // If a source block is now a trampoline, redirect successor phis
+                // from the source block to the preheader where the hoisted defs live.
+                for source_block in hoisted_from.iter() {
+                    let is_trampoline = editor.function().block(source_block).is_some_and(|b| {
+                        b.instructions()
+                            .iter()
+                            .all(|i| i.is_terminator() || matches!(i.op(), SsaOp::Nop))
+                    });
+                    if !is_trampoline {
+                        continue;
+                    }
+                    let successors: Vec<usize> = editor
+                        .function()
+                        .block(source_block)
+                        .map(|b| {
+                            b.instructions()
+                                .last()
+                                .map(|i| i.op().successors())
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default();
+                    for succ in successors {
+                        editor.replace_phi_predecessor(succ, source_block, preheader_idx)?;
                     }
                 }
-            }
+
+                Ok(())
+            },
+        );
+        if result.is_ok() {
+            total_hoisted = total_hoisted.saturating_add(hoisted_this_loop);
         }
     }
 
@@ -294,32 +318,48 @@ fn find_loop_invariants<T: Target>(
         }
     }
 
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block_idx in loop_info.body.iter() {
-            if let Some(block) = ssa.block(block_idx) {
-                for (instr_idx, instr) in block.instructions().iter().enumerate() {
-                    if invariants.contains(&(block_idx, instr_idx)) {
-                        continue;
-                    }
-                    if instr.is_terminator() {
-                        continue;
-                    }
-                    if matches!(instr.op(), SsaOp::Nop) {
-                        continue;
-                    }
-                    if is_instruction_invariant(
-                        instr,
-                        &outside_defs,
-                        &invariant_defs,
-                        &header_phi_defs,
-                    ) {
-                        invariants.insert((block_idx, instr_idx));
-                        if let Some(def) = instr.def() {
-                            invariant_defs.insert(def.index());
+    // Worklist over loop-body instructions: seed with all of them, and when an
+    // instruction becomes invariant, only re-examine the instructions that use
+    // its definitions (via a scoped def→users map). This replaces the previous
+    // `while changed { rescan whole loop body }` fixpoint, which was O(loop^2).
+    let mut users: HashMap<SsaVarId, Vec<(usize, usize)>> = HashMap::new();
+    let mut worklist: VecDeque<(usize, usize)> = VecDeque::new();
+    let mut queued: HashSet<(usize, usize)> = HashSet::new();
+    for block_idx in loop_info.body.iter() {
+        if let Some(block) = ssa.block(block_idx) {
+            for (instr_idx, instr) in block.instructions().iter().enumerate() {
+                if instr.is_terminator() || matches!(instr.op(), SsaOp::Nop) {
+                    continue;
+                }
+                instr.op().for_each_use(|u| {
+                    users.entry(u).or_default().push((block_idx, instr_idx));
+                });
+                worklist.push_back((block_idx, instr_idx));
+                queued.insert((block_idx, instr_idx));
+            }
+        }
+    }
+
+    while let Some((block_idx, instr_idx)) = worklist.pop_front() {
+        queued.remove(&(block_idx, instr_idx));
+        if invariants.contains(&(block_idx, instr_idx)) {
+            continue;
+        }
+        let Some(instr) = ssa
+            .block(block_idx)
+            .and_then(|b| b.instructions().get(instr_idx))
+        else {
+            continue;
+        };
+        if is_instruction_invariant(instr, &outside_defs, &invariant_defs, &header_phi_defs) {
+            invariants.insert((block_idx, instr_idx));
+            for def in instr.defs() {
+                invariant_defs.insert(def.index());
+                if let Some(dependents) = users.get(&def) {
+                    for &(ub, ui) in dependents {
+                        if !invariants.contains(&(ub, ui)) && queued.insert((ub, ui)) {
+                            worklist.push_back((ub, ui));
                         }
-                        changed = true;
                     }
                 }
             }
@@ -335,20 +375,22 @@ fn is_instruction_invariant<T: Target>(
     invariant_defs: &BitSet,
     header_phi_defs: &BitSet,
 ) -> bool {
-    for operand in instr.op().uses() {
+    let mut invariant = true;
+    instr.op().for_each_use(|operand| {
         if header_phi_defs.contains(operand.index()) {
-            return false;
+            invariant = false;
         }
         if !outside_defs.contains(operand.index()) && !invariant_defs.contains(operand.index()) {
-            return false;
+            invariant = false;
         }
-    }
-    true
+    });
+    invariant
 }
 
 fn can_hoist<T: Target>(
     ssa: &SsaFunction<T>,
     loop_info: &LoopInfo,
+    phi_back_edge_operands: &BitSet,
     block_idx: usize,
     instr_idx: usize,
 ) -> bool {
@@ -358,26 +400,44 @@ fn can_hoist<T: Target>(
     let Some(instr) = block.instruction(instr_idx) else {
         return false;
     };
-    if instr.def().is_none() {
+    if !instr.has_def() {
         return false;
     }
-    if !instr.op().is_pure() {
+    if !instr.op().effects().is_pure() {
         return false;
     }
     if loop_info.preheader.is_none() {
         return false;
     }
-    if let Some(dest) = instr.def() {
-        if feeds_phi_back_edge(ssa, loop_info, dest) {
+    for dest in instr.defs() {
+        if feeds_phi_back_edge(ssa, loop_info, phi_back_edge_operands, dest) {
             return false;
         }
     }
     true
 }
 
+fn phi_back_edge_operands<T: Target>(ssa: &SsaFunction<T>, loop_info: &LoopInfo) -> BitSet {
+    let mut operands = BitSet::new(ssa.var_id_capacity());
+    for phi_block_idx in loop_info.body.iter() {
+        let Some(phi_block) = ssa.block(phi_block_idx) else {
+            continue;
+        };
+        for phi in phi_block.phi_nodes() {
+            for operand in phi.operands() {
+                if loop_info.body.contains(operand.predecessor()) {
+                    operands.insert(operand.value().index());
+                }
+            }
+        }
+    }
+    operands
+}
+
 fn feeds_phi_back_edge<T: Target>(
     ssa: &SsaFunction<T>,
     loop_info: &LoopInfo,
+    phi_back_edge_operands: &BitSet,
     var: SsaVarId,
 ) -> bool {
     let mut worklist: VecDeque<SsaVarId> = VecDeque::new();
@@ -386,29 +446,26 @@ fn feeds_phi_back_edge<T: Target>(
     visited.insert(var.index());
 
     while let Some(current) = worklist.pop_front() {
-        for phi_block_idx in loop_info.body.iter() {
-            let Some(phi_block) = ssa.block(phi_block_idx) else {
+        if phi_back_edge_operands.contains(current.index()) {
+            return true;
+        }
+
+        let Some(current_var) = ssa.variable(current) else {
+            continue;
+        };
+        for site in current_var.uses() {
+            if site.is_phi_operand || !loop_info.body.contains(site.block) {
+                continue;
+            }
+            let Some(instr) = ssa
+                .block(site.block)
+                .and_then(|block| block.instruction(site.instruction))
+            else {
                 continue;
             };
-            for phi in phi_block.phi_nodes() {
-                for operand in phi.operands() {
-                    if operand.value() == current && loop_info.body.contains(operand.predecessor())
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-        for body_block_idx in loop_info.body.iter() {
-            if let Some(body_block) = ssa.block(body_block_idx) {
-                for instr in body_block.instructions() {
-                    if instr.op().uses().contains(&current) {
-                        if let Some(dest) = instr.def() {
-                            if visited.insert(dest.index()) {
-                                worklist.push_back(dest);
-                            }
-                        }
-                    }
+            for dest in instr.defs() {
+                if visited.insert(dest.index()) {
+                    worklist.push_back(dest);
                 }
             }
         }
@@ -424,10 +481,11 @@ mod tests {
         ir::{
             block::SsaBlock,
             instruction::SsaInstruction,
+            phi::{PhiNode, PhiOperand},
             value::ConstValue,
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
-        testing::{MockTarget, MockType},
+        testing::{run_mock_pass_boundary, MockTarget, MockType},
     };
 
     fn instr(op: SsaOp<MockTarget>) -> SsaInstruction<MockTarget> {
@@ -514,7 +572,8 @@ mod tests {
         let mut ssa = build_simple_loop();
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log);
+        let changed =
+            run_mock_pass_boundary(&mut ssa, "simple LICM hoist", |ssa| run(ssa, &method, &log));
         assert!(changed, "LICM should hoist invariant expression");
         assert!(log.has(EventKind::InstructionRemoved));
     }
@@ -534,7 +593,8 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log);
+        let changed =
+            run_mock_pass_boundary(&mut ssa, "no-loop LICM", |ssa| run(ssa, &method, &log));
         assert!(!changed, "no loops should mean nothing to hoist");
     }
 
@@ -566,9 +626,9 @@ mod tests {
 
         let mut b1 = SsaBlock::new(1);
         // phi_var is loop-variant (defined by phi in header, fed by back-edge)
-        let mut phi = crate::ir::phi::PhiNode::new(phi_var, VariableOrigin::Local(3));
-        phi.add_operand(crate::ir::phi::PhiOperand::new(iv, 0));
-        phi.add_operand(crate::ir::phi::PhiOperand::new(result, 2));
+        let mut phi = PhiNode::new(phi_var, VariableOrigin::Local(3));
+        phi.add_operand(PhiOperand::new(iv, 0));
+        phi.add_operand(PhiOperand::new(result, 2));
         b1.add_phi(phi);
         b1.add_instruction(instr(SsaOp::Branch {
             condition: cond,
@@ -595,7 +655,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log);
+        let changed = run_mock_pass_boundary(&mut ssa, "variant-operand LICM", |ssa| {
+            run(ssa, &method, &log)
+        });
         // phi_var is defined by header phi which is part of loop body, so Add should NOT be hoisted
         assert!(
             !changed,
@@ -608,7 +670,7 @@ mod tests {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log);
+        let changed = run_mock_pass_boundary(&mut ssa, "empty LICM", |ssa| run(ssa, &method, &log));
         assert!(!changed);
     }
 
@@ -618,6 +680,7 @@ mod tests {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 2);
         let v0 = local_at(&mut ssa, 0, 0, 0);
         let cond = local_at(&mut ssa, 1, 0, 1);
+        let sum = local_at(&mut ssa, 2, 0, 2);
         let mut b0 = SsaBlock::new(0);
         b0.add_instruction(instr(SsaOp::Const {
             dest: v0,
@@ -628,7 +691,7 @@ mod tests {
             value: ConstValue::I32(1),
         }));
         b0.add_instruction(instr(SsaOp::Add {
-            dest: SsaVarId::from_index(2),
+            dest: sum,
             left: v0,
             right: v0,
             flags: None,
@@ -646,7 +709,8 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log);
+        let changed =
+            run_mock_pass_boundary(&mut ssa, "no-preheader LICM", |ssa| run(ssa, &method, &log));
         assert!(!changed, "loop without preheader should not hoist");
     }
 
@@ -706,7 +770,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log);
+        let changed = run_mock_pass_boundary(&mut ssa, "multiple-invariant LICM", |ssa| {
+            run(ssa, &method, &log)
+        });
         assert!(changed, "multiple invariants should be hoisted");
     }
 }

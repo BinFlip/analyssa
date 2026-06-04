@@ -47,7 +47,10 @@ use crate::{
     bitset::BitSet,
     events::{EventKind, EventListener},
     ir::{
-        function::SsaFunction, instruction::SsaInstruction, ops::SsaOp, value::ConstValue,
+        function::{SsaEditOptions, SsaFunction, SsaRollbackPolicy},
+        instruction::SsaInstruction,
+        ops::SsaOp,
+        value::ConstValue,
         variable::SsaVarId,
     },
     pointer::PointerSize,
@@ -1525,58 +1528,6 @@ impl<T: Target> OpaquePredicatePass<T> {
         None
     }
 
-    /// Fallback evaluator for branch conditions that pattern matching cannot resolve.
-    ///
-    /// Creates an [`SsaEvaluator`] and runs a forward pass over all blocks from 0 through
-    /// `block_idx`, accumulating concrete values via dataflow propagation. If the condition
-    /// variable resolves to a constant after evaluation, returns `AlwaysTrue` (non-zero) or
-    /// `AlwaysFalse` (zero).
-    ///
-    /// This catches predicates that require multi-step constant propagation across blocks
-    /// (e.g., a value computed in block 0 that flows through assignments to block 5's branch).
-    ///
-    /// # Arguments
-    ///
-    /// * `ssa` - The SSA function to evaluate.
-    /// * `condition` - The branch condition variable to resolve.
-    /// * `block_idx` - The block containing the branch (evaluation covers blocks 0..=block_idx).
-    /// * `ptr_size` - Pointer size for the evaluator (affects address arithmetic).
-    ///
-    /// # Returns
-    ///
-    /// [`PredicateResult::AlwaysTrue`] or [`AlwaysFalse`](PredicateResult::AlwaysFalse) if the
-    /// evaluator resolves the condition to a constant. [`Unknown`](PredicateResult::Unknown) if
-    /// the value depends on runtime inputs, loops, or unresolvable phi operands.
-    fn evaluate_with_tracked(
-        ssa: &SsaFunction<T>,
-        condition: SsaVarId,
-        block_idx: usize,
-        ptr_size: PointerSize,
-    ) -> PredicateResult {
-        let mut evaluator = SsaEvaluator::new(ssa, ptr_size);
-
-        // Evaluate all blocks up to and including the current block.
-        // We use a simple forward pass - in complex cases with loops,
-        // this may not capture all values, but it handles linear flows.
-        for idx in 0..=block_idx {
-            // For blocks that precede our target, we can evaluate them
-            // to build up the value state
-            evaluator.evaluate_block(idx);
-        }
-
-        // Check if we have a concrete value for the condition
-        match evaluator.get(condition) {
-            Some(expr) if expr.is_constant() => {
-                if expr.as_constant().is_some_and(ConstValue::is_zero) {
-                    PredicateResult::AlwaysFalse
-                } else {
-                    PredicateResult::AlwaysTrue
-                }
-            }
-            Some(_) | None => PredicateResult::Unknown,
-        }
-    }
-
     /// Detects phi nodes where every operand resolves to the same constant value.
     ///
     /// Iterates over all phi nodes in all blocks. For each phi, looks up each operand's
@@ -1596,6 +1547,11 @@ impl<T: Target> OpaquePredicatePass<T> {
     fn analyze_phi_constants(ssa: &SsaFunction<T>) -> BTreeMap<SsaVarId, ConstValue<T>> {
         let mut phi_constants = BTreeMap::new();
 
+        // Index defining ops once (O(1) lookups) rather than calling
+        // `get_definition` per phi operand, whose slow path is a full-function
+        // scan when def-sites are stale.
+        let index = DefUseIndex::build_with_ops(ssa);
+
         for block in ssa.blocks() {
             for phi in block.phi_nodes() {
                 let operands: Vec<_> = phi.operands().iter().collect();
@@ -1610,8 +1566,8 @@ impl<T: Target> OpaquePredicatePass<T> {
 
                 for operand in &operands {
                     let var = operand.value();
-                    // Look up the definition
-                    if let Some(op) = ssa.get_definition(var) {
+                    // Look up the defining operation via the index.
+                    if let Some(op) = index.def_op(var) {
                         if let SsaOp::Const { value, .. } = op {
                             if const_value.is_none() {
                                 const_value = Some(value.clone());
@@ -1712,6 +1668,14 @@ impl<T: Target> OpaquePredicatePass<T> {
         // Collect phi replacements
         let mut phi_replacements: Vec<(usize, usize, SsaVarId, ConstValue<T>)> = Vec::new();
 
+        // Symbolic evaluator for branch conditions, built lazily and evaluated
+        // over every block exactly once. Previously each unresolved branch built
+        // a fresh evaluator and re-evaluated blocks `0..=block_idx`, which was
+        // O(branches * blocks); a single forward pass is sufficient because SSA
+        // values are single-assignment (evaluating later blocks never changes an
+        // earlier branch condition's value).
+        let mut branch_evaluator = None;
+
         // Analyze each block
         for (block_idx, block) in ssa.iter_blocks() {
             // Analyze branch terminators
@@ -1734,10 +1698,26 @@ impl<T: Target> OpaquePredicatePass<T> {
                 } else {
                     let mut result = Self::analyze_branch(*condition, &cache);
 
-                    // If pattern matching couldn't determine the result,
-                    // try using SsaEvaluator for dataflow-based analysis
+                    // If pattern matching couldn't determine the result, try the
+                    // shared symbolic evaluator (built and fully evaluated once).
                     if result == PredicateResult::Unknown {
-                        result = Self::evaluate_with_tracked(ssa, *condition, block_idx, ptr_size);
+                        let evaluator = branch_evaluator.get_or_insert_with(|| {
+                            let mut e = SsaEvaluator::new(ssa, ptr_size);
+                            for idx in 0..ssa.block_count() {
+                                e.evaluate_block(idx);
+                            }
+                            e
+                        });
+                        result = match evaluator.get(*condition) {
+                            Some(expr) if expr.is_constant() => {
+                                if expr.as_constant().is_some_and(ConstValue::is_zero) {
+                                    PredicateResult::AlwaysFalse
+                                } else {
+                                    PredicateResult::AlwaysTrue
+                                }
+                            }
+                            Some(_) | None => PredicateResult::Unknown,
+                        };
                     }
 
                     match result {
@@ -1778,17 +1758,37 @@ impl<T: Target> OpaquePredicatePass<T> {
             }
         }
 
+        // CFG-changing branch simplifications invalidate instruction and phi indices
+        // collected from the old graph. Apply them alone; the scheduler's next
+        // pass iteration will re-analyze comparisons and phis on the rebuilt SSA.
+        if !branch_simplifications.is_empty() {
+            comparison_replacements.clear();
+            comparison_simplifications.clear();
+            phi_replacements.clear();
+        }
+
         // Track structural changes (branches, comparisons) vs phi-only changes.
         // Phi constant replacement doesn't warrant rebuild_ssa (see comment below).
         let has_structural = !branch_simplifications.is_empty()
             || !comparison_replacements.is_empty()
             || !comparison_simplifications.is_empty();
 
-        // Apply branch simplifications
-        for (block_idx, target, is_true) in branch_simplifications {
-            if let Some(block) = ssa.block_mut(block_idx) {
-                if let Some(last_instr) = block.instructions_mut().last_mut() {
-                    last_instr.set_op(SsaOp::Jump { target });
+        let edit_result = ssa.edit(
+            SsaEditOptions::new()
+                .with_verify(true)
+                .with_rollback(SsaRollbackPolicy::OnFailure),
+            |editor| {
+                // Apply branch simplifications
+                for (block_idx, target, is_true) in branch_simplifications {
+                    let Some(last_idx) = editor
+                        .function()
+                        .block(block_idx)
+                        .and_then(|block| block.instructions().len().checked_sub(1))
+                    else {
+                        continue;
+                    };
+                    editor.replace_instruction_op(block_idx, last_idx, SsaOp::Jump { target })?;
+                    editor.mark_cfg_changed();
                     changes
                         .record(EventKind::OpaquePredicateRemoved)
                         .at(method_token.clone(), block_idx)
@@ -1801,46 +1801,60 @@ impl<T: Target> OpaquePredicatePass<T> {
                         .at(method_token.clone(), block_idx)
                         .message(format!("simplified to unconditional branch to {target}"));
                 }
-            }
-        }
 
-        // Apply comparison replacements (opaque predicates → constant true/false)
-        for (block_idx, instr_idx, dest, value) in comparison_replacements {
-            if let Some(block) = ssa.block_mut(block_idx) {
-                let const_value = if value {
-                    ConstValue::True
-                } else {
-                    ConstValue::False
-                };
-                if let Some(instr) = block.instructions_mut().get_mut(instr_idx) {
-                    instr.set_op(SsaOp::Const {
-                        dest,
-                        value: const_value,
-                    });
+                // Apply comparison replacements (opaque predicates → constant true/false)
+                for (block_idx, instr_idx, dest, value) in comparison_replacements {
+                    if editor
+                        .function()
+                        .block(block_idx)
+                        .and_then(|block| block.instruction(instr_idx))
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    let const_value = if value {
+                        ConstValue::True
+                    } else {
+                        ConstValue::False
+                    };
+                    editor.replace_instruction_op(
+                        block_idx,
+                        instr_idx,
+                        SsaOp::Const {
+                            dest,
+                            value: const_value,
+                        },
+                    )?;
                     changes
                         .record(EventKind::ConstantFolded)
                         .at(method_token.clone(), instr_idx)
                         .message(format!("opaque predicate → {value}"));
                 }
-            }
-        }
 
-        // Apply comparison simplifications (algebraic transformations)
-        for (block_idx, instr_idx, simplification) in comparison_simplifications {
-            if let Some(block) = ssa.block_mut(block_idx) {
-                match simplification {
-                    ComparisonSimplification::SimplerOp { new_op, reason } => {
-                        if let Some(instr) = block.instructions_mut().get_mut(instr_idx) {
-                            instr.set_op(new_op);
+                // Apply comparison simplifications (algebraic transformations)
+                for (block_idx, instr_idx, simplification) in comparison_simplifications {
+                    if editor
+                        .function()
+                        .block(block_idx)
+                        .and_then(|block| block.instruction(instr_idx))
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    match simplification {
+                        ComparisonSimplification::SimplerOp { new_op, reason } => {
+                            editor.replace_instruction_op(block_idx, instr_idx, new_op)?;
                             changes
                                 .record(EventKind::ConstantFolded)
                                 .at(method_token.clone(), instr_idx)
                                 .message(reason);
                         }
-                    }
-                    ComparisonSimplification::Copy { dest, src, reason } => {
-                        if let Some(instr) = block.instructions_mut().get_mut(instr_idx) {
-                            instr.set_op(SsaOp::Copy { dest, src });
+                        ComparisonSimplification::Copy { dest, src, reason } => {
+                            editor.replace_instruction_op(
+                                block_idx,
+                                instr_idx,
+                                SsaOp::Copy { dest, src },
+                            )?;
                             changes
                                 .record(EventKind::ConstantFolded)
                                 .at(method_token.clone(), instr_idx)
@@ -1848,42 +1862,41 @@ impl<T: Target> OpaquePredicatePass<T> {
                         }
                     }
                 }
-            }
-        }
 
-        // Apply phi replacements: PHIs where all operands are the same constant
-        // We replace the PHI with a constant instruction and remove the PHI.
-        // Process in reverse order to handle phi_idx correctly when removing.
-        let mut phi_removals: Vec<(usize, usize)> = Vec::new();
-        for (block_idx, phi_idx, phi_result, const_value) in phi_replacements {
-            // Create a constant instruction with the same destination as the PHI
-            let const_instr = SsaInstruction::synthetic(SsaOp::Const {
-                dest: phi_result,
-                value: const_value.clone(),
-            });
+                // Apply phi replacements: PHIs where all operands are the same constant.
+                let mut phi_removals: Vec<(usize, usize)> = Vec::new();
+                for (block_idx, phi_idx, phi_result, const_value) in phi_replacements {
+                    let const_instr = SsaInstruction::synthetic(SsaOp::Const {
+                        dest: phi_result,
+                        value: const_value.clone(),
+                    });
+                    editor.insert_instruction(block_idx, 0, const_instr)?;
+                    phi_removals.push((block_idx, phi_idx));
 
-            // Insert at the beginning of the block's instructions
-            if let Some(block) = ssa.block_mut(block_idx) {
-                block.instructions_mut().insert(0, const_instr);
-            }
-
-            // Mark this phi for removal
-            phi_removals.push((block_idx, phi_idx));
-
-            changes
-                .record(EventKind::ConstantFolded)
-                .at(method_token.clone(), block_idx)
-                .message(format!("phi with constant operands → {const_value:?}"));
-        }
-
-        // Remove the PHIs (in reverse order to maintain correct indices)
-        phi_removals.sort_by(|a, b| b.cmp(a)); // Sort descending by (block_idx, phi_idx)
-        for (block_idx, phi_idx) in phi_removals {
-            if let Some(block) = ssa.block_mut(block_idx) {
-                if phi_idx < block.phi_nodes().len() {
-                    block.phi_nodes_mut().remove(phi_idx);
+                    changes
+                        .record(EventKind::ConstantFolded)
+                        .at(method_token.clone(), block_idx)
+                        .message(format!("phi with constant operands → {const_value:?}"));
                 }
-            }
+
+                phi_removals.sort_by(|a, b| b.cmp(a));
+                for (block_idx, phi_idx) in phi_removals {
+                    if editor
+                        .function()
+                        .block(block_idx)
+                        .and_then(|block| block.phi_nodes().get(phi_idx))
+                        .is_some()
+                    {
+                        editor.remove_phi(block_idx, phi_idx)?;
+                    }
+                }
+
+                Ok(())
+            },
+        );
+
+        if edit_result.is_err() {
+            return false;
         }
 
         if !changes.is_empty() {
@@ -1928,11 +1941,12 @@ mod tests {
         ir::{
             block::SsaBlock,
             instruction::SsaInstruction,
+            phi::{PhiNode, PhiOperand},
             value::ConstValue,
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
         pointer::PointerSize,
-        testing::{MockTarget, MockType},
+        testing::{run_mock_pass_boundary, MockTarget, MockType},
     };
 
     fn instr(op: SsaOp<MockTarget>) -> SsaInstruction<MockTarget> {
@@ -1951,6 +1965,15 @@ mod tests {
             DefSite::instruction(block, instr),
             MockType::I32,
         )
+    }
+
+    fn run_predicates(
+        ssa: &mut SsaFunction<MockTarget>,
+        label: &str,
+        method: &u32,
+        log: &EventLog<MockTarget>,
+    ) -> bool {
+        run_mock_pass_boundary(ssa, label, |ssa| run(ssa, method, log, PointerSize::Bit64))
     }
 
     fn build_branch_with_opaque_predicate() -> SsaFunction<MockTarget> {
@@ -1992,7 +2015,7 @@ mod tests {
         let mut ssa = build_branch_with_opaque_predicate();
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 3u32;
-        let changed = run(&mut ssa, &method, &log, PointerSize::Bit64);
+        let changed = run_predicates(&mut ssa, "self-equality predicate", &method, &log);
         // The Ceq(v0, v0) should be detected as always true
         assert!(changed, "self-equality opaque predicate should be detected");
         assert!(log.has(EventKind::OpaquePredicateRemoved) || log.has(EventKind::BranchSimplified));
@@ -2038,7 +2061,7 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, PointerSize::Bit64);
+        let changed = run_predicates(&mut ssa, "xor-self predicate", &method, &log);
         assert!(changed, "xor-self pattern should be detected");
     }
 
@@ -2048,7 +2071,6 @@ mod tests {
         let v0 = local_at(&mut ssa, 0, 0, 0);
         let v_sub = local_at(&mut ssa, 1, 0, 1);
         let v_ceq = local_at(&mut ssa, 2, 0, 2);
-        let v_branch = local_at(&mut ssa, 3, 0, 3);
 
         let mut b1 = SsaBlock::new(1);
         b1.add_instruction(instr(SsaOp::Return { value: None }));
@@ -2074,7 +2096,7 @@ mod tests {
             right: v0,
         }));
         b0.add_instruction(instr(SsaOp::Branch {
-            condition: v_branch,
+            condition: v_ceq,
             true_target: 1,
             false_target: 2,
         }));
@@ -2083,7 +2105,8 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let _ = run(&mut ssa, &method, &log, PointerSize::Bit64);
+        let changed = run_predicates(&mut ssa, "sub-self predicate", &method, &log);
+        assert!(changed, "sub-self comparison should be detected");
     }
 
     #[test]
@@ -2125,7 +2148,7 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, PointerSize::Bit64);
+        let changed = run_predicates(&mut ssa, "constant-true predicate", &method, &log);
         assert!(changed, "constant equality should be detected");
     }
 
@@ -2168,7 +2191,8 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let _ = run(&mut ssa, &method, &log, PointerSize::Bit64);
+        let changed = run_predicates(&mut ssa, "constant-false predicate", &method, &log);
+        assert!(changed, "constant inequality should be detected");
     }
 
     #[test]
@@ -2205,7 +2229,7 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, PointerSize::Bit64);
+        let changed = run_predicates(&mut ssa, "same-var less-than predicate", &method, &log);
         assert!(changed, "x < x should be always false");
     }
 
@@ -2249,7 +2273,8 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let _ = run(&mut ssa, &method, &log, PointerSize::Bit64);
+        let changed = run_predicates(&mut ssa, "unsigned-less-than-zero predicate", &method, &log);
+        assert!(changed, "unsigned x < 0 should be always false");
     }
 
     #[test]
@@ -2277,9 +2302,9 @@ mod tests {
         ssa.add_block(b1);
 
         let mut b2 = SsaBlock::new(2);
-        let mut phi = crate::ir::phi::PhiNode::new(phi_var, VariableOrigin::Local(2));
-        phi.add_operand(crate::ir::phi::PhiOperand::new(v0, 0));
-        phi.add_operand(crate::ir::phi::PhiOperand::new(v1, 1));
+        let mut phi = PhiNode::new(phi_var, VariableOrigin::Local(2));
+        phi.add_operand(PhiOperand::new(v0, 0));
+        phi.add_operand(PhiOperand::new(v1, 1));
         b2.add_phi(phi);
         b2.add_instruction(instr(SsaOp::Return {
             value: Some(phi_var),
@@ -2323,11 +2348,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, PointerSize::Bit64);
+        let changed = run_predicates(&mut ssa, "constant-branch predicate", &method, &log);
         // The branch on constant 1 should be simplified
-        // Note: this may or may not be detected depending on whether
-        // the evaluator can resolve the constant
-        let _ = changed;
+        assert!(changed, "constant branch should be simplified");
     }
 
     #[test]
@@ -2335,7 +2358,7 @@ mod tests {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, PointerSize::Bit64);
+        let changed = run_predicates(&mut ssa, "empty predicates", &method, &log);
         assert!(!changed);
     }
 }

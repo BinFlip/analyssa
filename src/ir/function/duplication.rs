@@ -66,7 +66,7 @@ impl<T: Target> SsaFunction<T> {
         let instr_dests: Vec<SsaVarId> = block
             .instructions()
             .iter()
-            .filter_map(|instr| instr.op().dest())
+            .flat_map(|instr| instr.op().defs())
             .collect();
 
         // Allocate fresh IDs for phi node results

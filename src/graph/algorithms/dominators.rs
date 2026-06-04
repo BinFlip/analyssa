@@ -92,6 +92,10 @@ pub struct DominatorTree {
     children: Vec<Vec<NodeId>>,
     /// Number of nodes in the graph
     node_count: usize,
+    /// Predecessor lists for the graph this tree was computed from, retained so
+    /// [`compute_dominance_frontiers`] can reuse them instead of recomputing the
+    /// predecessor relation in a second O(V+E) pass.
+    predecessors: Vec<Vec<NodeId>>,
 }
 
 impl DominatorTree {
@@ -326,6 +330,7 @@ where
             idom: Vec::new(),
             children: Vec::new(),
             node_count: 0,
+            predecessors: Vec::new(),
         };
     }
 
@@ -356,6 +361,7 @@ where
         idom: lt.idom,
         children,
         node_count,
+        predecessors,
     }
 }
 
@@ -664,10 +670,21 @@ where
     G: Successors,
 {
     let n = graph.node_count();
+    // Dense per-node frontier bitsets: consumers (notably the SSA rebuilder)
+    // merge handler dominance frontiers via `BitSet` union, which needs the
+    // set representation.
     let mut frontiers: Vec<BitSet> = vec![BitSet::new(n); n];
 
-    // Pre-compute predecessors in a single O(V+E) pass
-    let all_preds = precompute_predecessors(graph);
+    // Reuse the predecessor lists cached on the dominator tree when they match
+    // this graph (the normal case — the tree was computed from it), avoiding a
+    // second O(V+E) predecessor pass. Fall back to recomputing otherwise.
+    let fallback;
+    let all_preds: &[Vec<NodeId>] = if dom_tree.predecessors.len() == n {
+        &dom_tree.predecessors
+    } else {
+        fallback = precompute_predecessors(graph);
+        &fallback
+    };
 
     // For each node, check if it's a join point (has multiple predecessors)
     // For each join point, walk up the dominator tree from each predecessor

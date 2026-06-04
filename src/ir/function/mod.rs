@@ -49,17 +49,27 @@
 //!
 //! `SsaFunction` is `Send` and `Sync` once constructed.
 
+mod builder;
 mod canonical;
 mod duplication;
+mod editor;
 mod kind;
 mod queries;
 mod rebuild;
 mod repair;
 mod transforms;
 
+pub use builder::{
+    AtomicCmpXchgSpec, AtomicLockRmwSpec, SsaBlockBuilder, SsaDefSpec, SsaFunctionBuilder,
+    VectorFaultingLoadSpec, VectorGatherSpec,
+};
+pub use editor::{
+    CheckedReplaceResult, ReplacementSkipReason, SkippedReplacement, SsaEditOptions, SsaEditReport,
+    SsaEditScope, SsaEditor, SsaRollbackPolicy,
+};
 pub use kind::FunctionKind;
 pub use queries::{MethodPurity, ReturnInfo};
-pub use transforms::TrivialPhiOptions;
+pub use transforms::{CopyPropagationResult, TrivialPhiOptions};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -67,7 +77,7 @@ use std::{
 };
 
 use crate::{
-    analysis::verifier::{SsaVerifier, VerifyLevel},
+    analysis::verifier::{SsaVerifier, VerifierError, VerifyLevel},
     ir::{
         block::SsaBlock,
         exception::SsaExceptionHandler,
@@ -489,32 +499,29 @@ impl<T: Target> SsaFunction<T> {
     /// without registering via `create_variable`).
     #[must_use]
     pub fn var_id_capacity(&self) -> usize {
-        let from_vars = self
-            .variables
-            .iter()
-            .map(|v| v.id().index().saturating_add(1))
-            .max()
-            .unwrap_or(0);
-        let from_blocks = self
-            .blocks
-            .iter()
-            .flat_map(|b| {
-                let phi_ids = b.phi_nodes().iter().flat_map(|p| {
-                    std::iter::once(p.result().index())
-                        .chain(p.operands().iter().map(|op| op.value().index()))
+        // Single allocation-free fold over every referenced variable id. Floored
+        // at `variables.len()` since IDs are normally dense.
+        let mut max_idx = self.variables.len();
+        for v in &self.variables {
+            max_idx = max_idx.max(v.id().index().saturating_add(1));
+        }
+        for b in &self.blocks {
+            for p in b.phi_nodes() {
+                max_idx = max_idx.max(p.result().index().saturating_add(1));
+                for op in p.operands() {
+                    max_idx = max_idx.max(op.value().index().saturating_add(1));
+                }
+            }
+            for i in b.instructions() {
+                for d in i.op().defs() {
+                    max_idx = max_idx.max(d.index().saturating_add(1));
+                }
+                i.op().for_each_use(|u| {
+                    max_idx = max_idx.max(u.index().saturating_add(1));
                 });
-                let instr_ids = b.instructions().iter().flat_map(|i| {
-                    i.op()
-                        .dest()
-                        .into_iter()
-                        .chain(i.op().uses())
-                        .map(|v| v.index())
-                });
-                phi_ids.chain(instr_ids)
-            })
-            .max()
-            .map_or(0, |m| m.saturating_add(1));
-        from_vars.max(from_blocks).max(self.variables.len())
+            }
+        }
+        max_idx
     }
 
     /// Returns all variable IDs for a given origin, ordered by creation.
@@ -1068,8 +1075,9 @@ impl<T: Target> SsaFunction<T> {
     ///
     /// # Errors
     ///
-    /// Returns `Err` with a description of the problem if any SSA invariant is violated,
-    /// such as cyclic dependencies, duplicate definitions, or misplaced terminators.
+    /// Returns `Err` with structured verifier diagnostics if any SSA
+    /// invariant is violated, such as cyclic dependencies, duplicate
+    /// definitions, or misplaced terminators.
     ///
     /// # Example
     ///
@@ -1081,16 +1089,12 @@ impl<T: Target> SsaFunction<T> {
     /// some_pass.run(&mut ssa);
     /// ssa.validate()?; // Check the pass didn't break SSA invariants
     /// ```
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), Vec<VerifierError>> {
         let errors = SsaVerifier::new(self).verify(VerifyLevel::Standard);
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(errors
-                .iter()
-                .map(|e| e.to_string())
-                .collect::<Vec<_>>()
-                .join("; "))
+            Err(errors)
         }
     }
 

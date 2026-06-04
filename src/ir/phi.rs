@@ -64,8 +64,10 @@ use crate::ir::variable::{SsaVarId, VariableOrigin};
 pub struct PhiOperand {
     /// The SSA variable providing the value.
     value: SsaVarId,
-    /// The predecessor block from which this value comes.
-    predecessor: usize,
+    /// The predecessor block from which this value comes. Stored as `u32`
+    /// (block counts never approach 2^32) to keep `PhiOperand` compact, since
+    /// phi nodes hold one operand per predecessor.
+    predecessor: u32,
 }
 
 impl PhiOperand {
@@ -77,7 +79,10 @@ impl PhiOperand {
     /// * `predecessor` - The block index from which this value comes
     #[must_use]
     pub const fn new(value: SsaVarId, predecessor: usize) -> Self {
-        Self { value, predecessor }
+        Self {
+            value,
+            predecessor: predecessor as u32,
+        }
     }
 
     /// Returns the SSA variable providing the value.
@@ -89,7 +94,7 @@ impl PhiOperand {
     /// Returns the predecessor block index.
     #[must_use]
     pub const fn predecessor(&self) -> usize {
-        self.predecessor
+        self.predecessor as usize
     }
 
     /// Updates the predecessor block index.
@@ -97,7 +102,7 @@ impl PhiOperand {
     /// Used when block merging redirects edges, requiring phi operands
     /// to reference the new predecessor instead of the eliminated trampoline.
     pub fn set_predecessor(&mut self, predecessor: usize) {
-        self.predecessor = predecessor;
+        self.predecessor = predecessor as u32;
     }
 }
 
@@ -259,7 +264,7 @@ impl PhiNode {
     pub fn operand_from(&self, predecessor: usize) -> Option<&PhiOperand> {
         self.operands
             .iter()
-            .find(|op| op.predecessor == predecessor)
+            .find(|op| op.predecessor() == predecessor)
     }
 
     /// Returns all the SSA variables used by this phi node.
@@ -271,7 +276,7 @@ impl PhiNode {
 
     /// Retains only operands whose predecessor satisfies the predicate.
     pub fn retain_operands<F: Fn(usize) -> bool>(&mut self, pred: F) {
-        self.operands.retain(|op| pred(op.predecessor));
+        self.operands.retain(|op| pred(op.predecessor()));
     }
 
     /// Sets the origin of this phi node.
@@ -295,7 +300,7 @@ impl PhiNode {
         if let Some(existing) = self
             .operands
             .iter_mut()
-            .find(|op| op.predecessor == predecessor)
+            .find(|op| op.predecessor() == predecessor)
         {
             existing.value = value;
         } else {

@@ -378,6 +378,24 @@ impl<'a, T: Target> PhiAnalyzer<'a, T> {
 /// Callback type for resolving Leave targets in exception handler blocks.
 pub(crate) type LeaveTargetFn<'a, T> = dyn Fn(usize, &[SsaBlock<T>]) -> Option<usize> + 'a;
 
+/// Input sets and callbacks used when placing pruned phi nodes.
+pub struct PhiPlacementConfig<'a, T: Target> {
+    /// Definition sites for each rename group.
+    pub defs: &'a BTreeMap<u32, BitSet>,
+    /// Live-in sets for each rename group.
+    pub live_in: &'a BTreeMap<u32, BitSet>,
+    /// Dominance frontier sets indexed by block.
+    pub dominance_frontiers: &'a [BitSet],
+    /// Reachable block set, or `None` to treat every block as reachable.
+    pub reachable: Option<&'a BitSet>,
+    /// Predicate that selects rename groups to process.
+    pub group_filter: &'a dyn Fn(u32) -> bool,
+    /// Maps a rename group to the origin used for inserted phi nodes.
+    pub group_to_origin: &'a dyn Fn(u32) -> VariableOrigin,
+    /// Optional callback that maps `leave` blocks to exceptional exit targets.
+    pub leave_target_fn: Option<&'a LeaveTargetFn<'a, T>>,
+}
+
 /// Places phi nodes at iterated dominance frontier blocks, pruned by liveness.
 ///
 /// This implements the standard IDF phi placement algorithm from Cytron et al.,
@@ -387,33 +405,24 @@ pub(crate) type LeaveTargetFn<'a, T> = dyn Fn(usize, &[SsaBlock<T>]) -> Option<u
 /// Data structures are keyed by `u32` group IDs. The `group_to_origin` mapping
 /// translates group IDs to `VariableOrigin` values for the created phi nodes.
 ///
-/// # Arguments
-///
-/// * `blocks` - Mutable slice of SSA blocks to insert phi nodes into
-/// * `defs` - Definition sites for each group ID
-/// * `live_in` - Liveness information: for each group ID, the set of blocks where it's live-in
-/// * `dominance_frontiers` - Precomputed dominance frontiers
-/// * `reachable` - Set of reachable block indices (if `None`, all blocks are considered reachable)
-/// * `group_filter` - Predicate to select which group IDs to process
-/// * `group_to_origin` - Maps group ID to the `VariableOrigin` to use for the phi node
-/// * `leave_target_fn` - Optional function to get Leave targets for exception handler blocks
-///   (used to add extra phi placement points for handler exits)
-///
 /// # Returns
+///
 /// A list of `(block_idx, group)` pairs for each phi node placed, in the order
 /// they were added to each block. This allows callers to associate phi nodes
 /// with their rename groups during the rename phase.
-#[allow(clippy::too_many_arguments)]
 pub fn place_pruned_phis<T: Target>(
     blocks: &mut [SsaBlock<T>],
-    defs: &BTreeMap<u32, BitSet>,
-    live_in: &BTreeMap<u32, BitSet>,
-    dominance_frontiers: &[BitSet],
-    reachable: Option<&BitSet>,
-    group_filter: &dyn Fn(u32) -> bool,
-    group_to_origin: &dyn Fn(u32) -> VariableOrigin,
-    leave_target_fn: Option<&LeaveTargetFn<'_, T>>,
+    config: PhiPlacementConfig<'_, T>,
 ) -> Vec<(usize, u32)> {
+    let PhiPlacementConfig {
+        defs,
+        live_in,
+        dominance_frontiers,
+        reachable,
+        group_filter,
+        group_to_origin,
+        leave_target_fn,
+    } = config;
     let block_count = blocks.len();
     let mut placements: Vec<(usize, u32)> = Vec::new();
 

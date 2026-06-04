@@ -25,10 +25,17 @@
 //! (blocks containing only a `Jump`) are handled by the block merging
 //! and control flow simplification passes.
 
+use std::collections::BTreeSet;
+
 use crate::{
-    analysis::{cfg::SsaCfg, evaluator::SsaEvaluator},
+    analysis::{cfg::SsaCfg, defuse::DefUseIndex, evaluator::SsaEvaluator},
     events::{EventKind, EventListener},
-    ir::{function::SsaFunction, ops::SsaOp, value::ConstValue, variable::SsaVarId},
+    ir::{
+        function::{SsaEditOptions, SsaEditor, SsaFunction},
+        ops::SsaOp,
+        value::ConstValue,
+        variable::SsaVarId,
+    },
     pointer::PointerSize,
     target::Target,
 };
@@ -65,6 +72,10 @@ where
     }
 
     let cfg = SsaCfg::from_ssa(ssa);
+    // One def-use index for the whole collection phase (ssa is not mutated until
+    // the edit below), so the per-branch safety check is O(local defs) instead
+    // of an O(N) full-function rescan.
+    let defuse = DefUseIndex::build(ssa);
 
     // Collect threading opportunities first to avoid borrow conflicts.
     let mut threadings: Vec<(usize, usize, usize)> = Vec::new();
@@ -78,6 +89,10 @@ where
         else {
             continue;
         };
+
+        if !is_safe_to_bypass_branch_block(ssa, block_idx, &defuse) {
+            continue;
+        }
 
         for pred_idx in cfg.block_predecessors(block_idx) {
             if let Some(target) = try_thread(
@@ -103,12 +118,73 @@ where
     }
 
     let mut changed = false;
-    for (pred_block, branch_block, new_target) in threadings {
-        if apply_threading(ssa, pred_block, branch_block, new_target, method, events) {
-            changed = true;
+    let result = ssa.edit(SsaEditOptions::new(), |editor| {
+        for (pred_block, branch_block, new_target) in threadings {
+            if apply_threading(editor, pred_block, branch_block, new_target, method, events) {
+                changed = true;
+            }
         }
+        Ok(())
+    });
+    if result.is_err() {
+        return false;
     }
     changed
+}
+
+fn is_safe_to_bypass_branch_block<T: Target>(
+    ssa: &SsaFunction<T>,
+    branch_block: usize,
+    defuse: &DefUseIndex<T>,
+) -> bool {
+    let Some(block) = ssa.block(branch_block) else {
+        return false;
+    };
+    let Some(terminator_idx) = block.instructions().len().checked_sub(1) else {
+        return false;
+    };
+
+    if !matches!(block.terminator_op(), Some(SsaOp::Branch { .. })) {
+        return false;
+    }
+
+    let mut local_defs = BTreeSet::new();
+    for phi in block.phi_nodes() {
+        local_defs.insert(phi.result());
+    }
+
+    for (instr_idx, instr) in block.instructions().iter().enumerate() {
+        if instr_idx == terminator_idx {
+            continue;
+        }
+        if !matches!(instr.op(), SsaOp::Nop) {
+            return false;
+        }
+        local_defs.extend(instr.defs());
+    }
+
+    if local_defs.is_empty() {
+        return true;
+    }
+
+    // A local def may be referenced only by this block's own branch terminator.
+    // Any phi-operand use, or any instruction use elsewhere, makes bypass unsafe.
+    // Querying the prebuilt def-use index touches only each local def's own use
+    // sites rather than rescanning the whole function per branch block.
+    for local in &local_defs {
+        if let Some(uses) = defuse.uses_of(*local) {
+            for use_site in uses {
+                let is_branch_terminator_use = !use_site.is_phi_operand
+                    && use_site.block == branch_block
+                    && use_site.instruction == terminator_idx;
+                if !is_branch_terminator_use {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
 }
 
 fn try_thread<T: Target>(
@@ -143,7 +219,7 @@ fn try_thread<T: Target>(
 }
 
 fn apply_threading<T, L>(
-    ssa: &mut SsaFunction<T>,
+    editor: &mut SsaEditor<T>,
     pred_block: usize,
     _branch_block: usize,
     new_target: usize,
@@ -154,16 +230,23 @@ where
     T: Target,
     L: EventListener<T> + ?Sized,
 {
-    let Some(block) = ssa.block_mut(pred_block) else {
-        return false;
-    };
-    let Some(last) = block.instructions_mut().last_mut() else {
+    let Some(op) = editor
+        .function()
+        .block(pred_block)
+        .and_then(|block| block.instructions().last())
+        .map(|instr| instr.op().clone())
+    else {
         return false;
     };
 
-    match last.op().clone() {
+    match op {
         SsaOp::Jump { target } if target != new_target => {
-            last.set_op(SsaOp::Jump { target: new_target });
+            if editor
+                .replace_terminator_op(pred_block, SsaOp::Jump { target: new_target })
+                .is_err()
+            {
+                return false;
+            }
             push(
                 events,
                 EventKind::ControlFlowRestructured,
@@ -183,14 +266,24 @@ where
             } else {
                 true_target
             };
-            last.set_op(SsaOp::Jump { target: new_target });
+            if editor
+                .replace_terminator_op(pred_block, SsaOp::Jump { target: new_target })
+                .is_err()
+            {
+                return false;
+            }
             push(events, EventKind::BranchSimplified, method, pred_block, format!(
                 "branch threaded: B{pred_block} condition on {condition:?} resolved to B{new_target} (eliminated B{old_target})"
             ));
             true
         }
         SsaOp::Leave { target } if target != new_target => {
-            last.set_op(SsaOp::Leave { target: new_target });
+            if editor
+                .replace_terminator_op(pred_block, SsaOp::Leave { target: new_target })
+                .is_err()
+            {
+                return false;
+            }
             push(
                 events,
                 EventKind::ControlFlowRestructured,
@@ -233,7 +326,7 @@ mod tests {
             value::ConstValue,
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
-        testing::{MockTarget, MockType},
+        testing::{run_mock_pass_boundary, MockTarget, MockType},
         PointerSize,
     };
 
@@ -298,7 +391,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, PointerSize::Bit64);
+        let changed = run_mock_pass_boundary(&mut ssa, "constant branch threading", |ssa| {
+            run(ssa, &method, &log, PointerSize::Bit64)
+        });
         assert!(changed, "constant true condition should be threaded");
         assert!(
             log.has(EventKind::BranchSimplified) || log.has(EventKind::ControlFlowRestructured)
@@ -352,8 +447,68 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, PointerSize::Bit64);
+        let changed = run_mock_pass_boundary(&mut ssa, "phi value branch threading", |ssa| {
+            run(ssa, &method, &log, PointerSize::Bit64)
+        });
         assert!(changed, "phi-based threading should work");
+    }
+
+    #[test]
+    fn no_threading_when_bypassed_phi_value_is_live_after_branch() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 3);
+        let true_cond = local_at(&mut ssa, 0, 0, 0);
+        let false_cond = local_at(&mut ssa, 1, 1, 0);
+        let merged_cond =
+            ssa.create_variable(VariableOrigin::Local(2), 0, DefSite::phi(2), MockType::I32);
+
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(instr(SsaOp::Const {
+            dest: true_cond,
+            value: ConstValue::I32(1),
+        }));
+        b0.add_instruction(instr(SsaOp::Jump { target: 2 }));
+        ssa.add_block(b0);
+
+        let mut b1 = SsaBlock::new(1);
+        b1.add_instruction(instr(SsaOp::Const {
+            dest: false_cond,
+            value: ConstValue::I32(0),
+        }));
+        b1.add_instruction(instr(SsaOp::Jump { target: 2 }));
+        ssa.add_block(b1);
+
+        let mut b2 = SsaBlock::new(2);
+        let mut phi = PhiNode::new(merged_cond, VariableOrigin::Local(2));
+        phi.add_operand(PhiOperand::new(true_cond, 0));
+        phi.add_operand(PhiOperand::new(false_cond, 1));
+        b2.add_phi(phi);
+        b2.add_instruction(instr(SsaOp::Branch {
+            condition: merged_cond,
+            true_target: 3,
+            false_target: 4,
+        }));
+        ssa.add_block(b2);
+
+        let mut b3 = SsaBlock::new(3);
+        b3.add_instruction(instr(SsaOp::Return {
+            value: Some(merged_cond),
+        }));
+        ssa.add_block(b3);
+
+        let mut b4 = SsaBlock::new(4);
+        b4.add_instruction(instr(SsaOp::Return { value: None }));
+        ssa.add_block(b4);
+        ssa.recompute_uses();
+
+        let log: EventLog<MockTarget> = EventLog::new();
+        let method = 0u32;
+        let changed = run_mock_pass_boundary(&mut ssa, "live phi branch threading", |ssa| {
+            run(ssa, &method, &log, PointerSize::Bit64)
+        });
+        assert!(
+            !changed,
+            "threading must not bypass a phi value used after the branch"
+        );
     }
 
     #[test]
@@ -385,7 +540,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, PointerSize::Bit64);
+        let changed = run_mock_pass_boundary(&mut ssa, "unknown condition threading", |ssa| {
+            run(ssa, &method, &log, PointerSize::Bit64)
+        });
         assert!(
             !changed,
             "no threading should occur when condition cannot be resolved"
@@ -397,7 +554,9 @@ mod tests {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, PointerSize::Bit64);
+        let changed = run_mock_pass_boundary(&mut ssa, "empty threading", |ssa| {
+            run(ssa, &method, &log, PointerSize::Bit64)
+        });
         assert!(!changed);
     }
 
@@ -418,27 +577,33 @@ mod tests {
             dest: cond,
             src: mid,
         }));
-        b0.add_instruction(instr(SsaOp::Branch {
-            condition: cond,
-            true_target: 1,
-            false_target: 2,
-        }));
+        b0.add_instruction(instr(SsaOp::Jump { target: 1 }));
         ssa.add_block(b0);
 
         let mut b1 = SsaBlock::new(1);
-        b1.add_instruction(instr(SsaOp::Return { value: None }));
+        b1.add_instruction(instr(SsaOp::Branch {
+            condition: cond,
+            true_target: 2,
+            false_target: 3,
+        }));
         ssa.add_block(b1);
 
         let mut b2 = SsaBlock::new(2);
         b2.add_instruction(instr(SsaOp::Return { value: None }));
         ssa.add_block(b2);
+
+        let mut b3 = SsaBlock::new(3);
+        b3.add_instruction(instr(SsaOp::Return { value: None }));
+        ssa.add_block(b3);
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, PointerSize::Bit64);
+        let changed = run_mock_pass_boundary(&mut ssa, "copy-chain branch threading", |ssa| {
+            run(ssa, &method, &log, PointerSize::Bit64)
+        });
         // The evaluator should trace through Copy chain to find constant
-        let _ = changed;
+        assert!(changed, "copy-chain condition should be threaded");
     }
 
     #[test]
@@ -451,7 +616,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, PointerSize::Bit64);
+        let changed = run_mock_pass_boundary(&mut ssa, "non-branch threading", |ssa| {
+            run(ssa, &method, &log, PointerSize::Bit64)
+        });
         assert!(!changed, "no branch means no threading");
     }
 
@@ -468,7 +635,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, PointerSize::Bit64);
+        let changed = run_mock_pass_boundary(&mut ssa, "jump terminator threading", |ssa| {
+            run(ssa, &method, &log, PointerSize::Bit64)
+        });
         assert!(!changed, "Jump should not be threaded by this pass");
     }
 }

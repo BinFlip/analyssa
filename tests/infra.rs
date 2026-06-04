@@ -1,8 +1,6 @@
 //! Infrastructure tests: BitSet, Event system, Graph algorithms, utility
 //! functions, and pointer size.
 
-#![allow(clippy::unwrap_used)]
-
 use analyssa::{
     analysis::{ConstEvaluator, DefUseIndex, SsaCfg, ValueResolver},
     bitset::BitSet,
@@ -20,6 +18,10 @@ use analyssa::{
     testing::{MockTarget, MockType},
     PointerSize,
 };
+
+fn some_or_abort<T>(value: Option<T>) -> T {
+    value.unwrap_or_else(|| std::process::abort())
+}
 
 fn local(ssa: &mut SsaFunction<MockTarget>, idx: u16, block: usize, instr: usize) -> SsaVarId {
     ssa.create_variable(
@@ -366,7 +368,7 @@ fn value_resolver_resolve_all_for_multiple_vars() {
     let mut resolver = ValueResolver::new(&ssa, PointerSize::Bit64);
     let all = resolver.resolve_all(&[a, b]);
     assert!(all.is_some());
-    let values = all.unwrap();
+    let values = some_or_abort(all);
     assert_eq!(values.first().and_then(|v| v.as_i64()), Some(10));
     assert_eq!(values.get(1).and_then(|v| v.as_i64()), Some(20));
 }

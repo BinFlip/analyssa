@@ -138,6 +138,32 @@ impl BitSet {
         self.words.iter().map(|w| w.count_ones() as usize).sum()
     }
 
+    /// Returns `true` if every bit in `0..len()` is set.
+    ///
+    /// Short-circuits on the first non-full word instead of popcounting the
+    /// whole set, which is cheaper than comparing [`count`](Self::count) to
+    /// [`len`](Self::len) for the common "is this a full set" lattice check.
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        let full_words = self.len / 64;
+        let rem = self.len % 64;
+        for i in 0..full_words {
+            match self.words.get(i) {
+                Some(&w) if w == u64::MAX => {}
+                _ => return false,
+            }
+        }
+        if rem != 0 {
+            // Low `rem` bits set, computed without subtraction.
+            let mask = !(u64::MAX << rem);
+            match self.words.get(full_words) {
+                Some(&w) if (w & mask) == mask => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
     /// Clears all bits.
     pub fn clear(&mut self) {
         for word in &mut self.words {
@@ -239,22 +265,30 @@ impl Iterator for BitSetIter<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         while self.word_idx < self.set.words.len() {
             let word = *self.set.words.get(self.word_idx)?;
-            while self.bit_idx < 64 {
-                let idx = self
-                    .word_idx
-                    .checked_mul(64)
-                    .and_then(|v| v.checked_add(self.bit_idx))?;
-                if idx >= self.set.len {
-                    return None;
-                }
-                let bit = self.bit_idx;
-                self.bit_idx = self.bit_idx.saturating_add(1);
-                if (word & (1u64 << bit)) != 0 {
-                    return Some(idx);
-                }
+            // Mask off the bits we have already consumed in this word, then
+            // jump straight to the next set bit. This makes iteration cost
+            // O(set bits + words) instead of O(capacity): all-zero words and
+            // long runs of zero bits are skipped in a single step.
+            let masked = if self.bit_idx >= 64 {
+                0
+            } else {
+                word & (u64::MAX << self.bit_idx)
+            };
+            if masked == 0 {
+                self.word_idx = self.word_idx.saturating_add(1);
+                self.bit_idx = 0;
+                continue;
             }
-            self.word_idx = self.word_idx.saturating_add(1);
-            self.bit_idx = 0;
+            let bit = masked.trailing_zeros() as usize;
+            let idx = self
+                .word_idx
+                .checked_mul(64)
+                .and_then(|v| v.checked_add(bit))?;
+            if idx >= self.set.len {
+                return None;
+            }
+            self.bit_idx = bit.saturating_add(1);
+            return Some(idx);
         }
         None
     }
@@ -298,6 +332,24 @@ mod tests {
         assert_eq!(bs.count(), 100);
         for i in 0..100 {
             assert!(bs.contains(i), "bit {i} should be set");
+        }
+    }
+
+    #[test]
+    fn test_bitset_is_full() {
+        // Empty capacity is vacuously full.
+        assert!(BitSet::new(0).is_full());
+        // Exercise both word-aligned and partial-word capacities.
+        for cap in [1usize, 63, 64, 65, 100, 128, 129] {
+            let full = BitSet::full(cap);
+            assert!(full.is_full(), "full({cap}) should be full");
+            assert_eq!(full.is_full(), full.count() == full.len());
+
+            let mut almost = BitSet::full(cap);
+            almost.remove(cap.saturating_sub(1));
+            assert!(!almost.is_full(), "full({cap}) minus a bit is not full");
+
+            assert!(!BitSet::new(cap).is_full() || cap == 0);
         }
     }
 

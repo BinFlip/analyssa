@@ -1,7 +1,5 @@
 //! Dataflow analysis tests: SCCP, liveness, reaching definitions.
 
-#![allow(clippy::unwrap_used)]
-
 use analyssa::{
     analysis::{
         cfg::SsaCfg,

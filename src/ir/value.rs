@@ -91,14 +91,21 @@ pub enum ConstValue<T: Target> {
     /// 64-bit IEEE 754 floating point constant.
     F64(f64),
 
+    /// Vector constant with one constant per lane.
+    ///
+    /// Boxed so the rarely-used vector arm does not widen every scalar
+    /// [`ConstValue`].
+    Vector(Box<[ConstValue<T>]>),
+
     /// String constant referenced by its metadata token (index into #US heap).
     /// The actual string content is resolved during code generation.
     String(u32),
 
     /// Decrypted string with inline content (not just a heap index).
     /// Used by deobfuscation passes that decrypt strings at analysis time.
-    /// Contains the actual string bytes for codegen to emit.
-    DecryptedString(String),
+    /// Contains the actual string bytes for codegen to emit. Boxed to keep
+    /// the common scalar [`ConstValue`] variants compact.
+    DecryptedString(Box<str>),
 
     /// Null reference constant.
     Null,
@@ -122,18 +129,23 @@ pub enum ConstValue<T: Target> {
     ///
     /// Stores the raw bytes and element type of an array that was decrypted
     /// at analysis time. Code generation emits `newarr` + element stores
-    /// to reconstruct the array in the output.
-    DecryptedArray {
-        /// Raw bytes of the array data in little-endian element layout.
-        data: Vec<u8>,
+    /// to reconstruct the array in the output. The payload is boxed (see
+    /// [`DecryptedArrayData`]) to keep [`ConstValue`] small.
+    DecryptedArray(Box<DecryptedArrayData<T>>),
+}
 
-        /// Reference to the element type in the host's metadata
-        /// (e.g., `TypeRef`/`TypeDef` token for CIL).
-        element_type_ref: T::TypeRef,
+/// Boxed payload for [`ConstValue::DecryptedArray`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecryptedArrayData<T: Target> {
+    /// Raw bytes of the array data in little-endian element layout.
+    pub data: Vec<u8>,
 
-        /// Size of each array element in bytes (1 for byte, 4 for int32, etc.).
-        element_size: usize,
-    },
+    /// Reference to the element type in the host's metadata
+    /// (e.g., `TypeRef`/`TypeDef` token for CIL).
+    pub element_type_ref: T::TypeRef,
+
+    /// Size of each array element in bytes (1 for byte, 4 for int32, etc.).
+    pub element_size: usize,
 }
 
 impl<T: Target> ConstValue<T> {
@@ -189,6 +201,12 @@ impl<T: Target> ConstValue<T> {
     #[must_use]
     pub const fn is_float(&self) -> bool {
         matches!(self, Self::F32(_) | Self::F64(_))
+    }
+
+    /// Returns `true` if this is a vector constant.
+    #[must_use]
+    pub const fn is_vector(&self) -> bool {
+        matches!(self, Self::Vector(_))
     }
 
     /// Returns `true` if this value is a string (`String` or `DecryptedString`).
@@ -330,7 +348,7 @@ impl<T: Target> ConstValue<T> {
     #[must_use]
     pub fn as_decrypted_string(&self) -> Option<&str> {
         match self {
-            Self::DecryptedString(s) => Some(s.as_str()),
+            Self::DecryptedString(s) => Some(&**s),
             _ => None,
         }
     }
@@ -1026,6 +1044,12 @@ impl<T: Target> ConstValue<T> {
         match self {
             Self::NativeInt(v) => Self::NativeInt(ptr_size.mask_signed(v)),
             Self::NativeUInt(v) => Self::NativeUInt(ptr_size.mask_unsigned(v)),
+            Self::Vector(lanes) => Self::Vector(
+                Vec::from(lanes)
+                    .into_iter()
+                    .map(|v| v.mask_native(ptr_size))
+                    .collect(),
+            ),
             other => other,
         }
     }
@@ -1145,21 +1169,28 @@ where
             Self::NativeUInt(v) => write!(f, "{v}un"),
             Self::F32(v) => write!(f, "{v}f"),
             Self::F64(v) => write!(f, "{v}"),
+            Self::Vector(lanes) => {
+                write!(f, "<")?;
+                for (idx, lane) in lanes.iter().enumerate() {
+                    if idx > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{lane}")?;
+                }
+                write!(f, ">")
+            }
             Self::String(idx) => write!(f, "str@{idx}"),
             Self::DecryptedString(s) => write!(f, "\"{}\"", s.escape_default()),
-            Self::DecryptedArray {
-                data,
-                element_type_ref,
-                element_size,
-            } => {
+            Self::DecryptedArray(arr) => {
                 write!(
                     f,
                     "array[{}x{}]<{}>",
-                    data.len()
-                        .checked_div(*element_size.max(&1))
-                        .unwrap_or(data.len()),
-                    element_size,
-                    element_type_ref
+                    arr.data
+                        .len()
+                        .checked_div(arr.element_size.max(1))
+                        .unwrap_or(arr.data.len()),
+                    arr.element_size,
+                    arr.element_type_ref
                 )
             }
             Self::Null => write!(f, "null"),
@@ -1568,7 +1599,7 @@ mod tests {
         assert!(Cv::U64(7).is_unsigned());
         assert!(Cv::F64(1.5).is_float());
         assert!(Cv::String(3).is_string_like());
-        assert!(Cv::DecryptedString("secret".to_string()).is_string_like());
+        assert!(Cv::DecryptedString("secret".into()).is_string_like());
 
         assert_eq!(Cv::I16(-2).as_i32(), Some(-2));
         assert_eq!(Cv::U32(9).as_i64(), Some(9));
@@ -1579,7 +1610,7 @@ mod tests {
         assert_eq!(Cv::False.as_bool(), Some(false));
         assert_eq!(Cv::I32(5).as_bool(), Some(true));
         assert_eq!(
-            Cv::DecryptedString("abc".to_string()).as_decrypted_string(),
+            Cv::DecryptedString("abc".into()).as_decrypted_string(),
             Some("abc")
         );
         assert_eq!(Cv::String(1).as_decrypted_string(), None);
@@ -1690,16 +1721,13 @@ mod tests {
     fn display_formats_constants_and_computed_values() {
         assert_eq!(Cv::I8(-1).to_string(), "-1i8");
         assert_eq!(Cv::U64(10).to_string(), "10UL");
+        assert_eq!(Cv::DecryptedString("a\nb".into()).to_string(), "\"a\\nb\"");
         assert_eq!(
-            Cv::DecryptedString("a\nb".to_string()).to_string(),
-            "\"a\\nb\""
-        );
-        assert_eq!(
-            Cv::DecryptedArray {
+            Cv::DecryptedArray(Box::new(DecryptedArrayData {
                 data: vec![1, 0, 2, 0],
                 element_type_ref: 7,
-                element_size: 2
-            }
+                element_size: 2,
+            }))
             .to_string(),
             "array[2x2]<7>"
         );

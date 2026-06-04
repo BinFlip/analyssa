@@ -141,6 +141,22 @@ struct TarjanState {
     sccs: Vec<Vec<NodeId>>,
 }
 
+struct TarjanFrame {
+    node: NodeId,
+    successors: Vec<NodeId>,
+    next_successor: usize,
+}
+
+impl TarjanFrame {
+    fn new<G: Successors>(graph: &G, node: NodeId) -> Self {
+        Self {
+            node,
+            successors: graph.successors(node).collect(),
+            next_successor: 0,
+        }
+    }
+}
+
 impl TarjanState {
     fn new(n: usize) -> Self {
         Self {
@@ -153,10 +169,8 @@ impl TarjanState {
         }
     }
 
-    fn strongconnect<G: Successors>(&mut self, graph: &G, v: NodeId) {
+    fn visit_node(&mut self, v: NodeId) {
         let v_idx = v.index();
-
-        // Set the depth index for v
         if let Some(slot) = self.index.get_mut(v_idx) {
             *slot = Some(self.current_index);
         }
@@ -168,30 +182,16 @@ impl TarjanState {
         if let Some(slot) = self.on_stack.get_mut(v_idx) {
             *slot = true;
         }
+    }
 
-        // Consider successors of v
-        for w in graph.successors(v) {
-            let w_idx = w.index();
-
-            let w_index_visited = self.index.get(w_idx).copied().flatten();
-            if w_index_visited.is_none() {
-                // Successor w has not yet been visited; recurse
-                self.strongconnect(graph, w);
-                let lw = self.lowlink.get(w_idx).copied().unwrap_or(usize::MAX);
-                if let Some(slot) = self.lowlink.get_mut(v_idx) {
-                    *slot = (*slot).min(lw);
-                }
-            } else if self.on_stack.get(w_idx).copied().unwrap_or(false) {
-                // Successor w is on stack and hence in the current SCC
-                if let Some(idx) = w_index_visited {
-                    if let Some(slot) = self.lowlink.get_mut(v_idx) {
-                        *slot = (*slot).min(idx);
-                    }
-                }
-            }
+    fn update_lowlink(&mut self, v: NodeId, candidate: usize) {
+        if let Some(slot) = self.lowlink.get_mut(v.index()) {
+            *slot = (*slot).min(candidate);
         }
+    }
 
-        // If v is a root node, pop the stack and generate an SCC
+    fn finish_component_if_root(&mut self, v: NodeId) {
+        let v_idx = v.index();
         let v_index = self.index.get(v_idx).copied().flatten();
         if let Some(idx) = v_index {
             if self.lowlink.get(v_idx).copied().unwrap_or(usize::MAX) == idx {
@@ -206,6 +206,36 @@ impl TarjanState {
                     }
                 }
                 self.sccs.push(scc);
+            }
+        }
+    }
+
+    fn strongconnect<G: Successors>(&mut self, graph: &G, v: NodeId) {
+        self.visit_node(v);
+        let mut work = vec![TarjanFrame::new(graph, v)];
+
+        while let Some(frame) = work.last_mut() {
+            if let Some(w) = frame.successors.get(frame.next_successor).copied() {
+                frame.next_successor = frame.next_successor.saturating_add(1);
+                let w_idx = w.index();
+                let w_index_visited = self.index.get(w_idx).copied().flatten();
+                if w_index_visited.is_none() {
+                    self.visit_node(w);
+                    work.push(TarjanFrame::new(graph, w));
+                } else if self.on_stack.get(w_idx).copied().unwrap_or(false) {
+                    if let Some(idx) = w_index_visited {
+                        self.update_lowlink(frame.node, idx);
+                    }
+                }
+                continue;
+            }
+
+            let v = frame.node;
+            let v_lowlink = self.lowlink.get(v.index()).copied().unwrap_or(usize::MAX);
+            self.finish_component_if_root(v);
+            work.pop();
+            if let Some(parent) = work.last() {
+                self.update_lowlink(parent.node, v_lowlink);
             }
         }
     }
@@ -541,6 +571,22 @@ mod tests {
         // All 100 nodes form one SCC
         assert_eq!(sccs.len(), 1);
         assert_eq!(sccs[0].len(), 100);
+    }
+
+    #[test]
+    fn test_scc_deep_linear_chain_is_iterative() {
+        let mut graph: DirectedGraph<usize, ()> = DirectedGraph::new();
+        let nodes: Vec<NodeId> = (0..10_000).map(|i| graph.add_node(i)).collect();
+
+        for pair in nodes.windows(2) {
+            graph.add_edge(pair[0], pair[1], ()).unwrap();
+        }
+
+        let sccs = strongly_connected_components(&graph);
+
+        assert_eq!(sccs.len(), nodes.len());
+        assert_eq!(sccs.first().and_then(|scc| scc.first()), nodes.last());
+        assert_eq!(sccs.last().and_then(|scc| scc.first()), nodes.first());
     }
 
     #[test]

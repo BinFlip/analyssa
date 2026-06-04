@@ -105,7 +105,7 @@ pub use events::{
 pub use host::{DirtySet, SsaStore};
 pub use pointer::PointerSize;
 pub use scheduling::{
-    DeobfuscationCapability, ModificationScope, PassScheduler, SsaPass, SsaPassHost,
+    DeobfuscationCapability, ModificationScope, PassScheduler, PipelineConfig, SsaPass, SsaPassHost,
 };
 pub use target::{Endianness, Target};
 pub use testing::{MockTarget, MockType};

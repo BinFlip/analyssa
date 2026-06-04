@@ -19,11 +19,13 @@
 //! Building the index is a single-pass O(n) scan where n is the total number
 //! of instructions and phi nodes:
 //!
-//! 1. Iterate over all `SsaVariable` entries, collecting definition sites,
-//!    use sites, and populating the location-indexed maps.
-//! 2. Identify phi-defined variables and unused variables.
-//! 3. Optionally collect defining operations by scanning all instructions
-//!    (O(m) where m is instruction count, needed for `build_with_ops`).
+//! 1. Seed all registered `SsaVariable` entries so entry and unused variables
+//!    remain queryable.
+//! 2. Scan active phi nodes and instructions to collect definitions, uses, and
+//!    location-indexed maps from the actual IR.
+//! 3. Identify phi-defined variables and unused variables.
+//! 4. Optionally collect defining operations while scanning instructions
+//!    (needed for `build_with_ops`).
 //!
 //! # Data Structures
 //!
@@ -139,11 +141,12 @@ impl Location {
 /// ```
 #[derive(Debug, Clone)]
 pub struct DefUseIndex<T: Target> {
-    /// Map from variable ID to its definition site.
-    definitions: BTreeMap<SsaVarId, DefSite>,
+    /// Definition site for each variable, indexed densely by `SsaVarId::index()`.
+    /// `None` marks an index outside the registered variable range.
+    definitions: Vec<Option<DefSite>>,
 
-    /// Map from variable ID to its use sites.
-    uses: BTreeMap<SsaVarId, Vec<UseSite>>,
+    /// Use sites for each variable, indexed densely by `SsaVarId::index()`.
+    uses: Vec<Vec<UseSite>>,
 
     /// Map from location to variables defined there.
     /// Key: (block_idx, instr_idx), Value: variables defined at that instruction.
@@ -153,8 +156,8 @@ pub struct DefUseIndex<T: Target> {
     /// Key: (block_idx, instr_idx), Value: variables used at that instruction.
     uses_at_location: BTreeMap<Location, Vec<SsaVarId>>,
 
-    /// Variables defined in each block (including phi nodes).
-    defs_in_block: BTreeMap<usize, Vec<SsaVarId>>,
+    /// Variables defined in each block (including phi nodes), indexed by block.
+    defs_in_block: Vec<Vec<SsaVarId>>,
 
     /// Variables defined by phi nodes.
     phi_defs: BitSet,
@@ -165,19 +168,20 @@ pub struct DefUseIndex<T: Target> {
     /// Total variable count.
     var_count: usize,
 
-    /// Optional: defining operations for each variable.
-    /// Populated when built with [`build_with_ops`](Self::build_with_ops).
-    def_ops: Option<BTreeMap<SsaVarId, SsaOp<T>>>,
+    /// Optional: defining operations for each variable, indexed densely by
+    /// `SsaVarId::index()`. Populated when built with
+    /// [`build_with_ops`](Self::build_with_ops).
+    def_ops: Option<Vec<Option<SsaOp<T>>>>,
 }
 
 impl<T: Target> Default for DefUseIndex<T> {
     fn default() -> Self {
         Self {
-            definitions: BTreeMap::new(),
-            uses: BTreeMap::new(),
+            definitions: Vec::new(),
+            uses: Vec::new(),
             defs_at_location: BTreeMap::new(),
             uses_at_location: BTreeMap::new(),
-            defs_in_block: BTreeMap::new(),
+            defs_in_block: Vec::new(),
             phi_defs: BitSet::default(),
             unused_vars: BitSet::default(),
             var_count: 0,
@@ -201,11 +205,8 @@ impl<T: Target> DefUseIndex<T> {
     /// A new `DefUseIndex` with all relationships computed.
     #[must_use]
     pub fn build(ssa: &SsaFunction<T>) -> Self {
-        let mut definitions = BTreeMap::new();
-        let mut uses: BTreeMap<SsaVarId, Vec<UseSite>> = BTreeMap::new();
         let mut defs_at_location: BTreeMap<Location, Vec<SsaVarId>> = BTreeMap::new();
         let mut uses_at_location: BTreeMap<Location, Vec<SsaVarId>> = BTreeMap::new();
-        let mut defs_in_block: BTreeMap<usize, Vec<SsaVarId>> = BTreeMap::new();
         let variable_count = ssa.variable_count();
         let max_var_idx = ssa
             .variables()
@@ -214,44 +215,85 @@ impl<T: Target> DefUseIndex<T> {
             .max()
             .unwrap_or(0);
         let bitset_capacity = max_var_idx.max(variable_count);
+        let block_count = ssa.blocks().len();
+
+        // Variables are densely indexed by `SsaVarId::index()`, so back the
+        // per-variable relationships with `Vec`s for O(1) cache-friendly lookup
+        // instead of `BTreeMap`'s O(log n) probes.
+        let mut definitions: Vec<Option<DefSite>> = vec![None; bitset_capacity];
+        let mut uses: Vec<Vec<UseSite>> = vec![Vec::new(); bitset_capacity];
+        let mut defs_in_block: Vec<Vec<SsaVarId>> = vec![Vec::new(); block_count];
         let mut phi_defs = BitSet::new(bitset_capacity);
 
-        // Collect from SsaVariables (the authoritative source)
+        // Helper: write a definition site at a variable's dense index.
+        let set_def = |definitions: &mut Vec<Option<DefSite>>, var: SsaVarId, site: DefSite| {
+            if let Some(slot) = definitions.get_mut(var.index()) {
+                *slot = Some(site);
+            }
+        };
+        let push_use = |uses: &mut Vec<Vec<UseSite>>, var: SsaVarId, site: UseSite| {
+            if let Some(slot) = uses.get_mut(var.index()) {
+                slot.push(site);
+            }
+        };
+
+        // Seed every registered variable so entry values and unused variables
+        // remain queryable even when they have no active instruction or phi
+        // definition. Active definitions and uses are then scanned from the IR
+        // itself so stale variable metadata cannot mislead optimization passes.
         for var in ssa.variables() {
-            let var_id = var.id();
-            let def_site = var.def_site();
-
-            definitions.insert(var_id, def_site);
-
-            // Track phi definitions
-            if def_site.is_phi() {
-                phi_defs.insert(var_id.index());
-            }
-
-            // Track definitions by location
-            if let Some(instr_idx) = def_site.instruction {
-                let loc = Location::new(def_site.block, instr_idx);
-                defs_at_location.entry(loc).or_default().push(var_id);
-            }
-            defs_in_block
-                .entry(def_site.block)
-                .or_default()
-                .push(var_id);
-
-            // Collect uses from the variable
-            let var_uses: Vec<UseSite> = var.uses().to_vec();
-            for use_site in &var_uses {
-                let loc = Location::new(use_site.block, use_site.instruction);
-                uses_at_location.entry(loc).or_default().push(var_id);
-            }
-            uses.insert(var_id, var_uses);
+            set_def(&mut definitions, var.id(), var.def_site());
         }
 
-        // Identify unused variables
+        for (block_idx, block) in ssa.blocks().iter().enumerate() {
+            for (phi_idx, phi) in block.phi_nodes().iter().enumerate() {
+                let result = phi.result();
+                set_def(&mut definitions, result, DefSite::phi(block_idx));
+                phi_defs.insert(result.index());
+                if let Some(slot) = defs_in_block.get_mut(block_idx) {
+                    slot.push(result);
+                }
+
+                for operand in phi.operands() {
+                    let var = operand.value();
+                    let use_site = UseSite::phi_operand(block_idx, phi_idx);
+                    push_use(&mut uses, var, use_site);
+                    uses_at_location
+                        .entry(Location::new(block_idx, phi_idx))
+                        .or_default()
+                        .push(var);
+                }
+            }
+
+            for (instr_idx, instr) in block.instructions().iter().enumerate() {
+                let loc = Location::new(block_idx, instr_idx);
+                let op = instr.op();
+                for dest in op.defs() {
+                    set_def(
+                        &mut definitions,
+                        dest,
+                        DefSite::instruction(block_idx, instr_idx),
+                    );
+                    defs_at_location.entry(loc).or_default().push(dest);
+                    if let Some(slot) = defs_in_block.get_mut(block_idx) {
+                        slot.push(dest);
+                    }
+                }
+                op.for_each_use(|var| {
+                    let use_site = UseSite::instruction(block_idx, instr_idx);
+                    push_use(&mut uses, var, use_site);
+                    uses_at_location.entry(loc).or_default().push(var);
+                });
+            }
+        }
+
+        // Identify unused variables. Only registered variables are considered,
+        // matching the previous seeded-map behavior.
         let mut unused_vars = BitSet::new(bitset_capacity);
-        for (var_id, use_sites) in &uses {
-            if use_sites.is_empty() {
-                unused_vars.insert(var_id.index());
+        for var in ssa.variables() {
+            let i = var.id().index();
+            if uses.get(i).is_some_and(Vec::is_empty) {
+                unused_vars.insert(i);
             }
         }
 
@@ -311,12 +353,14 @@ impl<T: Target> DefUseIndex<T> {
     pub fn build_with_ops(ssa: &SsaFunction<T>) -> Self {
         let mut index = Self::build(ssa);
 
-        // Collect defining operations
-        let mut def_ops = BTreeMap::new();
+        // Collect defining operations, densely indexed by variable.
+        let mut def_ops: Vec<Option<SsaOp<T>>> = vec![None; index.definitions.len()];
         for (_block_idx, _instr_idx, instr) in ssa.iter_instructions() {
             let op = instr.op();
-            if let Some(dest) = op.dest() {
-                def_ops.insert(dest, op.clone());
+            for dest in op.defs() {
+                if let Some(slot) = def_ops.get_mut(dest.index()) {
+                    *slot = Some(op.clone());
+                }
             }
         }
         index.def_ops = Some(def_ops);
@@ -340,7 +384,15 @@ impl<T: Target> DefUseIndex<T> {
     #[must_use]
     pub fn build_with_ops_map(ssa: &SsaFunction<T>) -> (Self, BTreeMap<SsaVarId, SsaOp<T>>) {
         let index = Self::build_with_ops(ssa);
-        let ops = index.def_ops.clone().unwrap_or_default();
+        // Materialize the compatibility map once from the dense op table.
+        let mut ops = BTreeMap::new();
+        if let Some(def_ops) = index.def_ops.as_ref() {
+            for (i, op) in def_ops.iter().enumerate() {
+                if let Some(op) = op {
+                    ops.insert(SsaVarId::from_index(i), op.clone());
+                }
+            }
+        }
         (index, ops)
     }
 
@@ -369,7 +421,7 @@ impl<T: Target> DefUseIndex<T> {
     /// - The index was not built with operations
     #[must_use]
     pub fn def_op(&self, var: SsaVarId) -> Option<&SsaOp<T>> {
-        self.def_ops.as_ref()?.get(&var)
+        self.def_ops.as_ref()?.get(var.index())?.as_ref()
     }
 
     /// Returns full definition information: block, instruction index, and operation.
@@ -426,7 +478,7 @@ impl<T: Target> DefUseIndex<T> {
     /// The definition site, or `None` if the variable is unknown.
     #[must_use]
     pub fn def_site(&self, var: SsaVarId) -> Option<DefSite> {
-        self.definitions.get(&var).copied()
+        self.definitions.get(var.index()).copied().flatten()
     }
 
     /// Returns all use sites for a variable.
@@ -440,7 +492,7 @@ impl<T: Target> DefUseIndex<T> {
     /// A slice of use sites, or `None` if the variable is unknown.
     #[must_use]
     pub fn uses_of(&self, var: SsaVarId) -> Option<&[UseSite]> {
-        self.uses.get(&var).map(Vec::as_slice)
+        self.uses.get(var.index()).map(Vec::as_slice)
     }
 
     /// Returns the number of uses for a variable.
@@ -454,7 +506,7 @@ impl<T: Target> DefUseIndex<T> {
     /// The use count, or 0 if the variable is unknown.
     #[must_use]
     pub fn use_count(&self, var: SsaVarId) -> usize {
-        self.uses.get(&var).map_or(0, Vec::len)
+        self.uses.get(var.index()).map_or(0, Vec::len)
     }
 
     /// Checks if a variable has any uses.
@@ -468,7 +520,7 @@ impl<T: Target> DefUseIndex<T> {
     /// `true` if the variable has at least one use.
     #[must_use]
     pub fn has_uses(&self, var: SsaVarId) -> bool {
-        self.uses.get(&var).is_some_and(|u| !u.is_empty())
+        self.uses.get(var.index()).is_some_and(|u| !u.is_empty())
     }
 
     /// Checks if a variable is unused (dead).
@@ -544,7 +596,7 @@ impl<T: Target> DefUseIndex<T> {
     /// A slice of variable IDs defined in the block.
     #[must_use]
     pub fn defs_in_block(&self, block: usize) -> &[SsaVarId] {
-        self.defs_in_block.get(&block).map_or(&[], Vec::as_slice)
+        self.defs_in_block.get(block).map_or(&[], Vec::as_slice)
     }
 
     /// Returns all unused (dead) variables.
@@ -609,7 +661,7 @@ impl<T: Target> DefUseIndex<T> {
     #[must_use]
     pub fn only_used_in_phis(&self, var: SsaVarId) -> bool {
         self.uses
-            .get(&var)
+            .get(var.index())
             .is_some_and(|uses| !uses.is_empty() && uses.iter().all(|u| u.is_phi_operand))
     }
 
@@ -646,7 +698,7 @@ impl<T: Target> DefUseIndex<T> {
     /// The single use site, or `None` if the variable has zero or multiple uses.
     #[must_use]
     pub fn single_use_site(&self, var: SsaVarId) -> Option<UseSite> {
-        self.uses.get(&var).and_then(|uses| {
+        self.uses.get(var.index()).and_then(|uses| {
             if uses.len() == 1 {
                 uses.first().copied()
             } else {
@@ -665,6 +717,7 @@ mod tests {
             function::SsaFunction,
             instruction::SsaInstruction,
             ops::SsaOp,
+            phi::PhiNode,
             value::ConstValue,
             variable::{DefSite, SsaVarId, SsaVariable, UseSite, VariableOrigin},
         },
@@ -798,6 +851,77 @@ mod tests {
     }
 
     #[test]
+    fn test_build_with_ops_indexes_secondary_defs() {
+        let mut ssa = SsaFunction::<MockTarget>::new(0, 0);
+        let left = SsaVarId::from_index(0);
+        let right = SsaVarId::from_index(1);
+        let value = SsaVarId::from_index(2);
+        let flags = SsaVarId::from_index(3);
+
+        ssa.variables_mut().push(SsaVariable::new(
+            left,
+            VariableOrigin::Local(0),
+            0,
+            DefSite::instruction(0, 0),
+            SsaType::I32,
+        ));
+        ssa.variables_mut().push(SsaVariable::new(
+            right,
+            VariableOrigin::Local(1),
+            0,
+            DefSite::instruction(0, 1),
+            SsaType::I32,
+        ));
+        ssa.variables_mut().push(SsaVariable::new(
+            value,
+            VariableOrigin::Local(2),
+            0,
+            DefSite::instruction(0, 2),
+            SsaType::I32,
+        ));
+        ssa.variables_mut().push(SsaVariable::new(
+            flags,
+            VariableOrigin::Local(3),
+            0,
+            DefSite::instruction(0, 2),
+            SsaType::I32,
+        ));
+
+        let mut block = SsaBlock::new(0);
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: left,
+            value: ConstValue::I32(1),
+        }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: right,
+            value: ConstValue::I32(2),
+        }));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::Add {
+            dest: value,
+            left,
+            right,
+            flags: Some(flags),
+        }));
+        ssa.add_block(block);
+
+        let index = DefUseIndex::build_with_ops(&ssa);
+        assert!(matches!(
+            index.def_op(value),
+            Some(SsaOp::Add {
+                flags: Some(f), ..
+            }) if *f == flags
+        ));
+        assert!(matches!(
+            index.def_op(flags),
+            Some(SsaOp::Add {
+                dest,
+                flags: Some(f),
+                ..
+            }) if *dest == value && *f == flags
+        ));
+    }
+
+    #[test]
     fn test_uses_at_location() {
         let (ssa, id0, id1) = make_test_ssa();
         let index = DefUseIndex::build(&ssa);
@@ -846,7 +970,7 @@ mod tests {
 
         // v0: defined but never used
         let v0 = SsaVariable::new(
-            SsaVarId::from_index(2),
+            dest0,
             VariableOrigin::Local(0),
             0,
             DefSite::instruction(0, 0),
@@ -857,7 +981,7 @@ mod tests {
 
         // v1: defined and used
         let mut v1 = SsaVariable::new(
-            SsaVarId::from_index(3),
+            dest1,
             VariableOrigin::Local(1),
             0,
             DefSite::instruction(0, 1),
@@ -898,7 +1022,12 @@ mod tests {
     #[test]
     fn test_phi_definitions() {
         let mut ssa = SsaFunction::<MockTarget>::new(0, 0);
-        let block = SsaBlock::new(0);
+        let mut block = SsaBlock::new(0);
+        block.add_phi(PhiNode::new(SsaVarId::from_index(0), VariableOrigin::Phi));
+        block.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: SsaVarId::from_index(1),
+            value: ConstValue::I32(0),
+        }));
         ssa.add_block(block);
 
         // v0: phi definition

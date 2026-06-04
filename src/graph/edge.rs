@@ -136,9 +136,10 @@ impl From<EdgeId> for usize {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+
     use super::*;
     use crate::graph::NodeId;
-    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn test_edge_id_new() {

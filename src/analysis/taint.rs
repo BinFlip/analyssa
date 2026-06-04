@@ -315,7 +315,7 @@ impl TaintAnalysis {
         if let Some(block_data) = ssa.block(block) {
             if let Some(instruction) = block_data.instructions().get(instr) {
                 // Taint the instruction's defined variable (for forward propagation)
-                if let Some(def) = instruction.def() {
+                for def in instruction.defs() {
                     self.tainted_vars.insert(def);
                 }
 
@@ -323,9 +323,9 @@ impl TaintAnalysis {
                 // This is critical for instructions like StoreStaticField that have
                 // no def - we need to taint what feeds into them.
                 if self.config.backward {
-                    for use_var in instruction.uses() {
+                    instruction.op().for_each_use(|use_var| {
                         self.tainted_vars.insert(use_var);
-                    }
+                    });
                 }
             }
         }
@@ -492,16 +492,23 @@ impl TaintAnalysis {
     fn propagate_instructions<T: Target>(&mut self, ssa: &SsaFunction<T>) -> bool {
         let mut changed = false;
 
+        // Reused across instructions so each instruction does not allocate fresh
+        // def/use vectors (these are read several times per instruction below).
+        let mut defs: Vec<SsaVarId> = Vec::new();
+        let mut uses: Vec<SsaVarId> = Vec::new();
+
         for (block_idx, instr_idx, instr) in ssa.iter_instructions() {
-            let def = instr.def();
-            let uses = instr.uses();
+            defs.clear();
+            defs.extend(instr.op().defs());
+            uses.clear();
+            instr.op().for_each_use(|u| uses.push(u));
 
             // Forward propagation: if any USE is tainted, DEF becomes tainted
             if self.config.forward {
-                if let Some(def_var) = def {
+                for def_var in &defs {
                     let uses_tainted = uses.iter().any(|u| self.tainted_vars.contains(u));
                     if uses_tainted {
-                        if self.tainted_vars.insert(def_var) {
+                        if self.tainted_vars.insert(*def_var) {
                             changed = true;
                         }
                         if self.tainted_instrs.insert((block_idx, instr_idx)) {
@@ -513,7 +520,7 @@ impl TaintAnalysis {
 
             // Backward propagation: if DEF is tainted, all USEs become tainted
             if self.config.backward {
-                let def_tainted = def.is_some_and(|d| self.tainted_vars.contains(&d));
+                let def_tainted = defs.iter().any(|d| self.tainted_vars.contains(d));
                 if def_tainted {
                     for use_var in &uses {
                         if self.tainted_vars.insert(*use_var) {

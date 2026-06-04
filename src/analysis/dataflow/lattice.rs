@@ -143,8 +143,8 @@ impl MeetSemiLattice for BitSet {
     }
 
     fn is_bottom(&self) -> bool {
-        // For may analysis, bottom is full set
-        self.count() == self.len()
+        // For may analysis, bottom is the full set.
+        self.is_full()
     }
 }
 

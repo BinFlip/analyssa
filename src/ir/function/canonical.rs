@@ -32,8 +32,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     ir::{
-        block::SsaBlock, function::SsaFunction, instruction::SsaInstruction, ops::SsaOp,
-        phi::PhiOperand, variable::SsaVarId,
+        block::SsaBlock,
+        function::SsaFunction,
+        instruction::SsaInstruction,
+        ops::SsaOp,
+        phi::PhiOperand,
+        variable::{DefSite, SsaVarId},
     },
     target::Target,
     BitSet,
@@ -94,12 +98,8 @@ impl<T: Target> SsaFunction<T> {
     /// This should be called after all deobfuscation passes complete, before
     /// code generation. The resulting SSA is cleaner and easier to convert to IL.
     pub fn canonicalize(&mut self) {
-        // Phase 1: Strip Nop instructions from all blocks
-        for block in &mut self.blocks {
-            block
-                .instructions_mut()
-                .retain(|instr| !matches!(instr.op(), SsaOp::Nop));
-        }
+        // Phase 1: Strip Nop instructions from all blocks and remap instruction DefSites.
+        self.strip_nops();
 
         // Collect blocks that must be preserved:
         // - Exception handler entry blocks
@@ -179,9 +179,9 @@ impl<T: Target> SsaFunction<T> {
         // For each block, collect all blocks that have edges TO it.
         let mut predecessors: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for (block_idx, block) in self.blocks.iter().enumerate() {
-            for target in block.successors() {
+            block.for_each_successor(|target| {
                 predecessors.entry(target).or_default().push(block_idx);
-            }
+            });
         }
 
         // Phase 4: Update all branch targets in remaining blocks.
@@ -308,6 +308,7 @@ impl<T: Target> SsaFunction<T> {
         }
 
         self.blocks = kept_blocks;
+        self.remap_variable_def_sites_after_block_compaction(&block_remap);
 
         // Phase 7: Remap exception handler block indices.
         for handler in &mut self.exception_handlers {
@@ -316,6 +317,36 @@ impl<T: Target> SsaFunction<T> {
 
         // Phase 8: Ensure the method has a valid terminator.
         self.ensure_valid_terminator();
+    }
+
+    /// Remaps variable definition sites after block compaction.
+    fn remap_variable_def_sites_after_block_compaction(&mut self, block_remap: &[Option<usize>]) {
+        let block_instr_counts: Vec<usize> = self
+            .blocks
+            .iter()
+            .map(|block| block.instructions().len())
+            .collect();
+
+        for var in &mut self.variables {
+            let site = var.def_site();
+            let Some(Some(new_block)) = block_remap.get(site.block) else {
+                var.set_def_site(DefSite::entry());
+                continue;
+            };
+
+            if let Some(instr_idx) = site.instruction {
+                if block_instr_counts
+                    .get(*new_block)
+                    .is_some_and(|count| instr_idx < *count)
+                {
+                    var.set_def_site(DefSite::instruction(*new_block, instr_idx));
+                } else {
+                    var.set_def_site(DefSite::entry());
+                }
+            } else {
+                var.set_def_site(DefSite::phi(*new_block));
+            }
+        }
     }
 
     /// Ensures the function has a valid terminator path from the entry block.
@@ -441,6 +472,11 @@ impl<T: Target> SsaFunction<T> {
                 true_target,
                 false_target,
                 ..
+            }
+            | SsaOp::BranchFlags {
+                true_target,
+                false_target,
+                ..
             } => {
                 remap_target(true_target);
                 remap_target(false_target);
@@ -452,6 +488,13 @@ impl<T: Target> SsaFunction<T> {
                     remap_target(target);
                 }
                 remap_target(default);
+            }
+            SsaOp::IndirectBranch {
+                resolved_targets, ..
+            } => {
+                for target in resolved_targets.iter_mut() {
+                    remap_target(target);
+                }
             }
             _ => {}
         }

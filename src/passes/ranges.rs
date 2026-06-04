@@ -43,7 +43,12 @@ use crate::{
     events::{EventKind, EventListener},
     graph::{NodeId, RootedGraph, Successors},
     ir::{
-        block::SsaBlock, function::SsaFunction, ops::SsaOp, phi::PhiNode, value::ConstValue,
+        block::SsaBlock,
+        function::{SsaEditOptions, SsaFunction},
+        instruction::SsaInstruction,
+        ops::SsaOp,
+        phi::PhiNode,
+        value::ConstValue,
         variable::SsaVarId,
     },
     target::Target,
@@ -111,47 +116,63 @@ where
 
     let mut changed = false;
 
-    for (block_idx, target, is_true) in branch_simplifications {
-        if let Some(block) = ssa.block_mut(block_idx) {
-            if let Some(last_instr) = block.instructions_mut().last_mut() {
-                last_instr.set_op(SsaOp::Jump { target });
-                let event = crate::events::Event {
-                    kind: EventKind::OpaquePredicateRemoved,
-                    method: Some(method.clone()),
-                    location: Some(block_idx),
-                    message: format!(
-                        "range analysis: condition always {}",
-                        if is_true { "true" } else { "false" }
-                    ),
-                    pass: None,
-                };
-                events.push(event);
-                let event = crate::events::Event {
-                    kind: EventKind::BranchSimplified,
-                    method: Some(method.clone()),
-                    location: Some(block_idx),
-                    message: format!("simplified to unconditional jump to {target}"),
-                    pass: None,
-                };
-                events.push(event);
-                changed = true;
-            }
-        }
-    }
+    let result = ssa.edit(SsaEditOptions::new(), |editor| {
+        for (block_idx, target, is_true) in branch_simplifications {
+            let Some(last_idx) = editor
+                .function()
+                .block(block_idx)
+                .and_then(|block| block.instructions().len().checked_sub(1))
+            else {
+                continue;
+            };
 
-    for (block_idx, instr_idx, dest, value) in comparison_replacements {
-        if let Some(block) = ssa.block_mut(block_idx) {
+            editor.replace_instruction_op(block_idx, last_idx, SsaOp::Jump { target })?;
+            editor.mark_cfg_changed();
+            let event = crate::events::Event {
+                kind: EventKind::OpaquePredicateRemoved,
+                method: Some(method.clone()),
+                location: Some(block_idx),
+                message: format!(
+                    "range analysis: condition always {}",
+                    if is_true { "true" } else { "false" }
+                ),
+                pass: None,
+            };
+            events.push(event);
+            let event = crate::events::Event {
+                kind: EventKind::BranchSimplified,
+                method: Some(method.clone()),
+                location: Some(block_idx),
+                message: format!("simplified to unconditional jump to {target}"),
+                pass: None,
+            };
+            events.push(event);
+            changed = true;
+        }
+
+        for (block_idx, instr_idx, dest, value) in comparison_replacements {
+            if editor
+                .function()
+                .block(block_idx)
+                .and_then(|block| block.instruction(instr_idx))
+                .is_none()
+            {
+                continue;
+            }
+
             let const_value = if value {
                 ConstValue::True
             } else {
                 ConstValue::False
             };
-            if let Some(instr) = block.instructions_mut().get_mut(instr_idx) {
-                instr.set_op(SsaOp::Const {
+            editor.replace_instruction_op(
+                block_idx,
+                instr_idx,
+                SsaOp::Const {
                     dest,
                     value: const_value,
-                });
-            }
+                },
+            )?;
             let event = crate::events::Event {
                 kind: EventKind::ConstantFolded,
                 method: Some(method.clone()),
@@ -162,6 +183,11 @@ where
             events.push(event);
             changed = true;
         }
+        Ok(())
+    });
+
+    if result.is_err() {
+        return false;
     }
 
     changed
@@ -272,7 +298,7 @@ impl<T: Target> RangeAnalysis<T> {
         self.initialize(ssa, &cfg);
         self.propagate(ssa, &cfg);
         RangeResult {
-            ranges: self.ranges.clone(),
+            ranges: std::mem::take(&mut self.ranges),
         }
     }
 
@@ -351,10 +377,7 @@ impl<T: Target> RangeAnalysis<T> {
 
     fn process_block_definitions(&mut self, block: &SsaBlock<T>) {
         for instr in block.instructions() {
-            if let Some(def) = instr.def() {
-                let range = self.evaluate_instruction(instr.op());
-                self.update_range(def, &range);
-            }
+            self.update_instruction_defs(instr);
         }
     }
 
@@ -377,15 +400,24 @@ impl<T: Target> RangeAnalysis<T> {
                     }
                 } else if let Some(block) = ssa.block(block_id) {
                     if let Some(instr) = block.instruction(use_site.instruction) {
-                        if let Some(def) = instr.def() {
-                            let range = self.evaluate_instruction(instr.op());
-                            self.update_range(def, &range);
-                        }
+                        self.update_instruction_defs(instr);
                         if instr.is_terminator() {
                             self.propagate_outgoing_edges(block_id, block, cfg);
                         }
                     }
                 }
+            }
+        }
+    }
+
+    fn update_instruction_defs(&mut self, instr: &SsaInstruction<T>) {
+        let primary = instr.op().dest();
+        let range = self.evaluate_instruction(instr.op());
+        for def in instr.defs() {
+            if Some(def) == primary {
+                self.update_range(def, &range);
+            } else {
+                self.update_range(def, &ValueRange::top());
             }
         }
     }
@@ -595,10 +627,11 @@ mod tests {
         ir::{
             block::SsaBlock,
             instruction::SsaInstruction,
+            phi::{PhiNode, PhiOperand},
             value::ConstValue,
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
-        testing::{MockTarget, MockType},
+        testing::{mock_terminator_at, run_mock_pass_boundary, MockTarget, MockType},
     };
 
     #[test]
@@ -737,9 +770,13 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 20);
-        let _ = changed;
-        // Just verify no crash
+        let changed = run_mock_pass_boundary(&mut ssa, "copy range propagation", |ssa| {
+            run(ssa, &method, &log, 20)
+        });
+        assert!(
+            !changed,
+            "copy-only range propagation should not rewrite SSA"
+        );
     }
 
     #[test]
@@ -769,20 +806,19 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let _ = run(&mut ssa, &method, &log, 20);
+        let changed = run_mock_pass_boundary(&mut ssa, "add range propagation", |ssa| {
+            run(ssa, &method, &log, 20)
+        });
+        assert!(
+            !changed,
+            "range propagation through add should not rewrite SSA"
+        );
     }
 
     #[test]
     fn range_simplifies_branch_with_constant_condition() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 2);
         let v0 = local_at(&mut ssa, 0, 0, 0);
-        let mut b1 = SsaBlock::new(1);
-        b1.add_instruction(instr(SsaOp::Return { value: None }));
-        ssa.add_block(b1);
-        let mut b2 = SsaBlock::new(2);
-        b2.add_instruction(instr(SsaOp::Return { value: None }));
-        ssa.add_block(b2);
-
         let mut b0 = SsaBlock::new(0);
         b0.add_instruction(instr(SsaOp::Const {
             dest: v0,
@@ -794,18 +830,27 @@ mod tests {
             false_target: 2,
         }));
         ssa.add_block(b0);
+
+        let mut b1 = SsaBlock::new(1);
+        b1.add_instruction(instr(SsaOp::Return { value: None }));
+        ssa.add_block(b1);
+
+        let mut b2 = SsaBlock::new(2);
+        b2.add_instruction(instr(SsaOp::Return { value: None }));
+        ssa.add_block(b2);
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 20);
+        let changed = run_mock_pass_boundary(&mut ssa, "constant branch range folding", |ssa| {
+            run(ssa, &method, &log, 20)
+        });
         // Branch on constant 1 should be simplified to Jump 1
-        if changed {
-            assert!(matches!(
-                ssa.block(0).unwrap().terminator_op().unwrap(),
-                SsaOp::Jump { target: 1 }
-            ));
-        }
+        assert!(changed, "constant branch should be simplified");
+        assert!(matches!(
+            mock_terminator_at(&ssa, 0),
+            SsaOp::Jump { target: 1 }
+        ));
     }
 
     #[test]
@@ -828,7 +873,9 @@ mod tests {
         ssa.recompute_uses();
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 20);
+        let changed = run_mock_pass_boundary(&mut ssa, "single-block range pass", |ssa| {
+            run(ssa, &method, &log, 20)
+        });
         assert!(!changed);
     }
 
@@ -860,11 +907,12 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 20);
+        let changed = run_mock_pass_boundary(&mut ssa, "comparison range folding", |ssa| {
+            run(ssa, &method, &log, 20)
+        });
         // Should fold Clt to Const(true)
-        if changed {
-            assert!(log.has(EventKind::ConstantFolded));
-        }
+        assert!(changed, "range-known comparison should fold");
+        assert!(log.has(EventKind::ConstantFolded));
     }
 
     #[test]
@@ -901,9 +949,9 @@ mod tests {
         ssa.add_block(b1);
 
         let mut b2 = SsaBlock::new(2);
-        let mut phi = crate::ir::phi::PhiNode::new(phi_var, VariableOrigin::Local(2));
-        phi.add_operand(crate::ir::phi::PhiOperand::new(v0, 0));
-        phi.add_operand(crate::ir::phi::PhiOperand::new(v1, 1));
+        let mut phi = PhiNode::new(phi_var, VariableOrigin::Local(2));
+        phi.add_operand(PhiOperand::new(v0, 0));
+        phi.add_operand(PhiOperand::new(v1, 1));
         b2.add_phi(phi);
         b2.add_instruction(instr(SsaOp::Return {
             value: Some(phi_var),
@@ -913,7 +961,10 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let _ = run(&mut ssa, &method, &log, 20);
+        let changed = run_mock_pass_boundary(&mut ssa, "phi range propagation", |ssa| {
+            run(ssa, &method, &log, 20)
+        });
+        assert!(changed, "constant branch before phi should simplify");
     }
 
     #[test]

@@ -10,13 +10,18 @@
 //!    source is in a different rename group. This prevents information loss
 //!    when the variable's value cannot be recovered from a phi node or
 //!    address-taken location.
-//! 3. **Resolve chains**: replace `dest → src` pairs with
+//! 3. **Protect ordering**: exclude copies whose replacement source is
+//!    defined later in the same block than an existing destination use.
+//! 4. **Resolve chains**: replace `dest → src` pairs with
 //!    `dest → ultimate_src` using [`resolve_chain`].
-//! 4. **Propagate**: call [`SsaFunction::propagate_copies`] to rewrite all
+//! 5. **Propagate**: call [`SsaFunction::propagate_copies`] to rewrite all
 //!    uses of dest variables to their ultimate sources.
-//! 5. **Nop out**: replace original copy-defining instructions with `Nop`
-//!    so a subsequent DCE pass removes them.
-//! 6. **Repeat** until no more changes (converges in 1–3 iterations).
+//! 6. **Nop out and repair**: replace fully propagated copy-defining
+//!    instructions with `Nop`, strip those nops, compact the variable table,
+//!    and recompute use lists so the pass does not leave orphan variables.
+//! 7. **Validate**: if the repaired function is not verifier-clean, restore
+//!    the pre-iteration function and report no progress for that iteration.
+//! 8. **Repeat** until no more changes (converges in 1–3 iterations).
 //!
 //! # Host hook
 //!
@@ -38,7 +43,11 @@ use crate::{
     analysis::phis::PhiAnalyzer,
     bitset::BitSet,
     events::{EventKind, EventListener},
-    ir::{function::SsaFunction, ops::SsaOp, variable::SsaVarId},
+    ir::{
+        function::{SsaEditOptions, SsaFunction, SsaRollbackPolicy},
+        ops::SsaOp,
+        variable::SsaVarId,
+    },
     passes::utils::resolve_chain,
     target::Target,
 };
@@ -144,36 +153,60 @@ where
     }
 
     protect_sole_local_defs(ssa, &mut copies);
+    // `source_defs` depends only on `ssa`, so build it once and reuse it for
+    // both ordering-protection passes below instead of rebuilding per call.
+    let source_defs = build_source_defs(ssa);
+    protect_same_block_ordering_with(ssa, &source_defs, &mut copies);
 
     let resolved: BTreeMap<SsaVarId, SsaVarId> = copies
         .iter()
         .map(|(&dest, &src)| (dest, resolve_chain(&copies, src)))
         .collect();
+    let mut resolved = resolved;
+    protect_same_block_ordering_with(ssa, &source_defs, &mut resolved);
 
     on_resolved(ssa, &resolved);
 
-    let result = ssa.propagate_copies(&resolved);
+    let mut result = None;
+    let edit_result = ssa.edit(
+        SsaEditOptions::new()
+            .with_verify(true)
+            .with_rollback(SsaRollbackPolicy::OnFailure),
+        |editor| {
+            let propagation = editor.propagate_copies(&resolved);
+            for dest_idx in propagation.fully_propagated.iter() {
+                editor.nop_copy_defining(SsaVarId::from_index(dest_idx));
+            }
+            result = Some(propagation);
+            Ok(())
+        },
+    );
+    if edit_result.is_err() {
+        return 0;
+    }
+    let Some(result) = result else {
+        return 0;
+    };
 
-    for dest_idx in result
+    let event_pairs: Vec<(SsaVarId, SsaVarId)> = result
         .fully_propagated
         .iter()
         .chain(result.partially_propagated.iter())
-    {
-        let dest = SsaVarId::from_index(dest_idx);
-        if let Some(src) = resolved.get(&dest) {
-            let event = crate::events::Event {
-                kind: EventKind::CopyPropagated,
-                method: Some(method.clone()),
-                location: None,
-                message: format!("{dest} → {src}"),
-                pass: None,
-            };
-            events.push(event);
-        }
-    }
+        .filter_map(|dest_idx| {
+            let dest = SsaVarId::from_index(dest_idx);
+            resolved.get(&dest).copied().map(|src| (dest, src))
+        })
+        .collect();
 
-    for dest_idx in result.fully_propagated.iter() {
-        ssa.nop_copy_defining(SsaVarId::from_index(dest_idx));
+    for (dest, src) in event_pairs {
+        let event = crate::events::Event {
+            kind: EventKind::CopyPropagated,
+            method: Some(method.clone()),
+            location: None,
+            message: format!("{dest} → {src}"),
+            pass: None,
+        };
+        events.push(event);
     }
 
     result.total_replaced
@@ -201,25 +234,32 @@ pub fn protect_sole_local_defs<T: Target>(
 ) {
     let real_local_limit = (ssa.num_args() as u32).saturating_add(ssa.num_locals() as u32);
 
+    let group_bound = ssa
+        .num_locals()
+        .saturating_add(ssa.num_args())
+        .saturating_add(1);
+    // Single traversal collecting all three facts: per-group definition counts,
+    // groups referenced by phi nodes, and address-taken groups.
     let mut group_def_count: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut groups_in_phis = BitSet::new(group_bound);
+    let mut address_taken_groups = BitSet::new(group_bound);
     for block in ssa.blocks() {
         for instr in block.instructions() {
-            if let Some(dest) = instr.op().dest() {
+            let op = instr.op();
+            for dest in op.defs() {
                 let group = ssa.rename_group(dest);
                 if group < real_local_limit {
                     let counter = group_def_count.entry(group).or_insert(0);
                     *counter = counter.saturating_add(1);
                 }
             }
+            if let SsaOp::LoadLocalAddr { local_index, .. } = op {
+                let group = (ssa.num_args() as u32).saturating_add(*local_index as u32);
+                if group < real_local_limit {
+                    address_taken_groups.insert(group as usize);
+                }
+            }
         }
-    }
-
-    let group_bound = ssa
-        .num_locals()
-        .saturating_add(ssa.num_args())
-        .saturating_add(1);
-    let mut groups_in_phis = BitSet::new(group_bound);
-    for block in ssa.blocks() {
         for phi in block.phi_nodes() {
             for operand in phi.operands() {
                 let group = ssa.rename_group(operand.value());
@@ -230,18 +270,6 @@ pub fn protect_sole_local_defs<T: Target>(
             let result_group = ssa.rename_group(phi.result());
             if result_group < real_local_limit {
                 groups_in_phis.insert(result_group as usize);
-            }
-        }
-    }
-
-    let mut address_taken_groups = BitSet::new(group_bound);
-    for block in ssa.blocks() {
-        for instr in block.instructions() {
-            if let SsaOp::LoadLocalAddr { local_index, .. } = instr.op() {
-                let group = (ssa.num_args() as u32).saturating_add(*local_index as u32);
-                if group < real_local_limit {
-                    address_taken_groups.insert(group as usize);
-                }
             }
         }
     }
@@ -268,6 +296,70 @@ pub fn protect_sole_local_defs<T: Target>(
     }
 }
 
+/// Removes copies that could create same-block use-before-def ordering.
+///
+/// A replacement `dest -> src` is unsafe when `src` is defined by an
+/// instruction in block `B` and `dest` is used by an earlier instruction in
+/// the same block. Rewriting that use would place `src` before its
+/// definition, violating SSA instruction order.
+///
+/// # Arguments
+///
+/// * `ssa` - The SSA function providing definitions and uses.
+/// * `copies` - Mutable map of copy replacements to filter in place.
+pub fn protect_same_block_ordering<T: Target>(
+    ssa: &SsaFunction<T>,
+    copies: &mut BTreeMap<SsaVarId, SsaVarId>,
+) {
+    let source_defs = build_source_defs(ssa);
+    protect_same_block_ordering_with(ssa, &source_defs, copies);
+}
+
+/// Builds a `def-variable -> (block, instruction)` index in a single pass.
+///
+/// The result depends only on `ssa`, so callers that filter multiple copy
+/// maps for the same function can build it once and reuse it across
+/// [`protect_same_block_ordering_with`] calls.
+fn build_source_defs<T: Target>(ssa: &SsaFunction<T>) -> BTreeMap<SsaVarId, (usize, usize)> {
+    let mut source_defs: BTreeMap<SsaVarId, (usize, usize)> = BTreeMap::new();
+    for (block_idx, block) in ssa.blocks().iter().enumerate() {
+        for (instr_idx, instr) in block.instructions().iter().enumerate() {
+            for dest in instr.op().defs() {
+                source_defs.insert(dest, (block_idx, instr_idx));
+            }
+        }
+    }
+    source_defs
+}
+
+/// Like [`protect_same_block_ordering`] but reuses a prebuilt `source_defs`
+/// index (see [`build_source_defs`]) instead of recomputing it.
+fn protect_same_block_ordering_with<T: Target>(
+    ssa: &SsaFunction<T>,
+    source_defs: &BTreeMap<SsaVarId, (usize, usize)>,
+    copies: &mut BTreeMap<SsaVarId, SsaVarId>,
+) {
+    copies.retain(|dest, src| {
+        let Some((src_block, src_instr)) = source_defs.get(src).copied() else {
+            return true;
+        };
+        let Some(block) = ssa.block(src_block) else {
+            return true;
+        };
+
+        for (instr_idx, instr) in block.instructions().iter().enumerate() {
+            if instr_idx >= src_instr {
+                break;
+            }
+            if instr.op().uses_var(*dest) {
+                return false;
+            }
+        }
+
+        true
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,7 +371,10 @@ mod tests {
             value::ConstValue,
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
-        testing::{MockTarget, MockType},
+        testing::{
+            assert_mock_valid_full, mock_terminator_at, run_mock_pass_boundary, MockTarget,
+            MockType,
+        },
     };
 
     fn instr(op: SsaOp<MockTarget>) -> SsaInstruction<MockTarget> {
@@ -317,7 +412,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 10);
+        let changed = run_mock_pass_boundary(&mut ssa, "simple copy propagation", |ssa| {
+            run(ssa, &method, &log, 10)
+        });
         assert!(changed, "simple copy should be eliminated");
         assert!(log.has(EventKind::CopyPropagated));
     }
@@ -341,7 +438,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 10);
+        let changed = run_mock_pass_boundary(&mut ssa, "copy chain propagation", |ssa| {
+            run(ssa, &method, &log, 10)
+        });
         assert!(changed, "three-element chain should be collapsed");
     }
 
@@ -360,7 +459,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 10);
+        let changed = run_mock_pass_boundary(&mut ssa, "no-copy propagation", |ssa| {
+            run(ssa, &method, &log, 10)
+        });
         assert!(!changed, "no copies should mean no changes");
     }
 
@@ -369,7 +470,9 @@ mod tests {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 10);
+        let changed = run_mock_pass_boundary(&mut ssa, "empty copy propagation", |ssa| {
+            run(ssa, &method, &log, 10)
+        });
         assert!(!changed);
     }
 
@@ -390,7 +493,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 0);
+        let changed = run_mock_pass_boundary(&mut ssa, "zero-iteration copy propagation", |ssa| {
+            run(ssa, &method, &log, 0)
+        });
         assert!(!changed, "zero iterations should make no changes");
     }
 
@@ -413,9 +518,12 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let _ = run(&mut ssa, &method, &log, 10);
+        let changed = run_mock_pass_boundary(&mut ssa, "existing-value copy propagation", |ssa| {
+            run(ssa, &method, &log, 10)
+        });
+        assert!(changed, "copy propagation should rewrite existing values");
         // The return should reference v0 (a) or v2 (c) — propagation happens
-        let ret = ssa.block(0).unwrap().terminator_op().unwrap();
+        let ret = mock_terminator_at(&ssa, 0);
         assert!(matches!(ret, SsaOp::Return { .. }));
     }
 
@@ -435,7 +543,9 @@ mod tests {
         ssa.recompute_uses();
 
         let log: EventLog<MockTarget> = EventLog::new();
+        assert_mock_valid_full(&ssa, "copy propagation iteration before");
         let count = run_iteration(&mut ssa, &0u32, &log, |_, _| {});
+        assert_mock_valid_full(&ssa, "copy propagation iteration after");
         assert!(count > 0, "should have replaced at least one use");
     }
 
@@ -466,7 +576,80 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 10);
+        let changed = run_mock_pass_boundary(&mut ssa, "multi-block copy propagation", |ssa| {
+            run(ssa, &method, &log, 10)
+        });
         assert!(changed, "chain across blocks should be collapsed");
+    }
+
+    #[test]
+    fn protect_same_block_ordering_removes_late_source_replacement() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 4);
+        let dest = local_at(&mut ssa, 0, 0, 0);
+        let use_before_src = local_at(&mut ssa, 1, 0, 1);
+        let src = local_at(&mut ssa, 2, 0, 2);
+        let one = local_at(&mut ssa, 3, 0, 3);
+
+        let mut block = SsaBlock::new(0);
+        block.add_instruction(instr(SsaOp::Const {
+            dest,
+            value: ConstValue::I32(10),
+        }));
+        block.add_instruction(instr(SsaOp::Add {
+            dest: use_before_src,
+            left: dest,
+            right: dest,
+            flags: None,
+        }));
+        block.add_instruction(instr(SsaOp::Const {
+            dest: src,
+            value: ConstValue::I32(20),
+        }));
+        block.add_instruction(instr(SsaOp::Const {
+            dest: one,
+            value: ConstValue::I32(1),
+        }));
+        block.add_instruction(instr(SsaOp::Return {
+            value: Some(use_before_src),
+        }));
+        ssa.add_block(block);
+        ssa.recompute_uses();
+        assert_mock_valid_full(&ssa, "same-block ordering protection fixture");
+
+        let mut copies = BTreeMap::from([(dest, src)]);
+        protect_same_block_ordering(&ssa, &mut copies);
+
+        assert!(copies.is_empty());
+    }
+
+    #[test]
+    fn propagated_copies_do_not_leave_orphan_variables() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 4);
+        let a = local_at(&mut ssa, 0, 0, 0);
+        let b = local_at(&mut ssa, 1, 0, 1);
+        let c = local_at(&mut ssa, 2, 0, 2);
+        let out = local_at(&mut ssa, 3, 0, 3);
+        let mut block = SsaBlock::new(0);
+        block.add_instruction(instr(SsaOp::Const {
+            dest: a,
+            value: ConstValue::I32(10),
+        }));
+        block.add_instruction(instr(SsaOp::Copy { dest: b, src: a }));
+        block.add_instruction(instr(SsaOp::Copy { dest: c, src: b }));
+        block.add_instruction(instr(SsaOp::Copy { dest: out, src: c }));
+        block.add_instruction(instr(SsaOp::Return { value: Some(out) }));
+        ssa.add_block(block);
+        ssa.recompute_uses();
+
+        let log: EventLog<MockTarget> = EventLog::new();
+        let method = 0u32;
+        assert!(run_mock_pass_boundary(
+            &mut ssa,
+            "orphan-free copy propagation",
+            |ssa| run(ssa, &method, &log, 10)
+        ));
+        assert!(!ssa
+            .iter_instructions()
+            .any(|(_, _, instr)| matches!(instr.op(), SsaOp::Copy { .. })));
     }
 }

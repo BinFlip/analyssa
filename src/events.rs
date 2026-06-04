@@ -165,6 +165,16 @@ pub trait EventListener<T: Target> {
     /// Append an event to this listener.
     fn push(&self, event: Event<T>);
 
+    /// Returns `true` if this listener actually records events.
+    ///
+    /// Defaults to `true`. Sinks that discard everything (e.g.
+    /// [`NullListener`]) override this to `false` so the [`EventBuilder`] can
+    /// skip constructing the event and its default message entirely — avoiding
+    /// per-event allocation on the hot logging path when no one is observing.
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
     /// Open a fluent builder for an event of `kind`. The event is appended
     /// when the builder is dropped, mirroring the legacy `EventLog::record`
     /// API.
@@ -186,6 +196,10 @@ pub struct NullListener;
 
 impl<T: Target> EventListener<T> for NullListener {
     fn push(&self, _event: Event<T>) {}
+
+    fn is_enabled(&self) -> bool {
+        false
+    }
 }
 
 /// Builder for creating events with a fluent API. Created via
@@ -248,6 +262,12 @@ impl<'a, T: Target, L: EventListener<T> + ?Sized> EventBuilder<'a, T, L> {
 
 impl<T: Target, L: EventListener<T> + ?Sized> Drop for EventBuilder<'_, T, L> {
     fn drop(&mut self) {
+        // Skip building the event (and its default-message allocation) entirely
+        // when the sink discards everything.
+        if !self.listener.is_enabled() {
+            return;
+        }
+
         let message = self
             .message
             .take()
@@ -377,6 +397,18 @@ impl<T: Target> EventLog<T> {
     #[must_use]
     pub fn take(&self) -> EventLog<T> {
         self.clone()
+    }
+
+    /// Consumes the log and returns its events, moving them out instead of
+    /// cloning.
+    ///
+    /// Prefer this over [`take`](Self::take) when the log is owned and no
+    /// longer needed: `take` must deep-clone every event (including its
+    /// `String` message) because `boxcar::Vec` is append-only, whereas this
+    /// drains the backing store by value.
+    #[must_use]
+    pub fn into_events(self) -> Vec<Event<T>> {
+        self.events.into_iter().collect()
     }
 
     /// Returns an iterator over events for a specific method.
@@ -931,6 +963,31 @@ mod tests {
         }
 
         assert_eq!(log.len(), 400);
+    }
+
+    #[test]
+    fn into_events_moves_without_cloning() {
+        let log: EventLog<MockTarget> = EventLog::new();
+        log.record(EventKind::StringDecrypted)
+            .at(method(0x0600_0001), 0)
+            .message("a");
+        log.record(EventKind::ConstantFolded)
+            .at(method(0x0600_0002), 1)
+            .message("b");
+        let events = log.into_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, EventKind::StringDecrypted);
+        assert_eq!(events[1].kind, EventKind::ConstantFolded);
+    }
+
+    #[test]
+    fn null_listener_is_disabled() {
+        let null = NullListener;
+        assert!(!EventListener::<MockTarget>::is_enabled(&null));
+        // Recording through a disabled listener must not panic and yields nothing.
+        EventListener::<MockTarget>::record(&null, EventKind::StringDecrypted)
+            .at(method(0x0600_0003), 0)
+            .message("ignored");
     }
 
     #[test]

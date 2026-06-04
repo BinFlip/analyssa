@@ -286,6 +286,17 @@ impl<T: Target> SsaBlock<T> {
             .map_or_else(Vec::new, super::SsaOp::successors)
     }
 
+    /// Calls `f` for every successor block index of this block, without
+    /// allocating. Allocation-free equivalent of [`successors`](Self::successors).
+    pub fn for_each_successor<F>(&self, f: F)
+    where
+        F: FnMut(usize),
+    {
+        if let Some(op) = self.terminator_op() {
+            op.for_each_successor(f);
+        }
+    }
+
     /// Redirects control flow targets from `old_target` to `new_target`.
     ///
     /// This modifies the block's terminator instruction in-place, redirecting any
@@ -389,13 +400,11 @@ impl<T: Target> SsaBlock<T> {
         for instr in &mut self.instructions {
             let op = instr.op_mut();
             // Skip if this would create a self-referential instruction
-            if let Some(dest) = op.dest() {
-                if dest == new_var {
-                    if op.uses().contains(&old_var) {
-                        skipped = skipped.saturating_add(1);
-                    }
-                    continue;
+            if op.defs().any(|dest| dest == new_var) {
+                if op.uses_var(old_var) {
+                    skipped = skipped.saturating_add(1);
                 }
+                continue;
             }
             replaced = replaced.saturating_add(op.replace_uses(old_var, new_var));
         }
@@ -594,7 +603,7 @@ impl<T: Target> SsaBlock<T> {
             let Some(instr) = self.instructions.get(idx) else {
                 continue;
             };
-            if let Some(dest) = instr.def() {
+            for dest in instr.defs() {
                 def_index.insert(dest, idx);
             }
         }
@@ -635,13 +644,13 @@ impl<T: Target> SsaBlock<T> {
             };
 
             // Add data dependencies (def-use chains)
-            for used in &instr.uses() {
+            instr.for_each_use(|used| {
                 // Skip if defined by phi (always available)
                 if used.index() < phi_defs.len() && phi_defs.contains(used.index()) {
-                    continue;
+                    return;
                 }
                 // Skip if not defined in this block
-                if let Some(&dep_idx) = def_index.get(used) {
+                if let Some(&dep_idx) = def_index.get(&used) {
                     if dep_idx != idx {
                         if let Some(&dep_pos) = idx_to_pos.get(&dep_idx) {
                             // instruction at pos depends on instruction at dep_pos
@@ -654,7 +663,7 @@ impl<T: Target> SsaBlock<T> {
                         }
                     }
                 }
-            }
+            });
 
             // Add ordering dependency for side-effecting operations.
             // Each side-effecting instruction depends on the previous one to preserve

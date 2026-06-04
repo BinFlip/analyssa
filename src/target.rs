@@ -20,11 +20,391 @@
 //! - **`ptr_bytes` is runtime, not const.** CLR is bi-arch (32 vs 64). A
 //!   typical instance carries the pointer width chosen at construction.
 
-use std::fmt::Debug;
-use std::hash::Hash;
+use std::{fmt::Debug, hash::Hash};
 
-use crate::ir::value::ConstValue;
-use crate::PointerSize;
+use crate::{ir::value::ConstValue, PointerSize};
+
+/// Element category for a target-independent vector lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VectorLaneKind {
+    /// Integer lane with an explicit bit width.
+    Integer,
+    /// Floating-point lane with an explicit bit width.
+    Float,
+    /// Pointer-sized native integer lane whose concrete width is target-dependent.
+    NativeInteger,
+}
+
+/// Describes the lane layout of a target-independent vector value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VectorShape {
+    /// Number of lanes in the vector.
+    pub lane_count: u32,
+    /// Kind of scalar stored in each lane.
+    pub lane_kind: VectorLaneKind,
+    /// Bit width of each lane.
+    pub lane_bits: u32,
+    /// Total bit width of the vector register or value.
+    pub total_bits: u32,
+}
+
+impl VectorShape {
+    /// Creates a vector shape after validating its lane and total widths.
+    #[must_use]
+    pub const fn new(
+        lane_count: u32,
+        lane_kind: VectorLaneKind,
+        lane_bits: u32,
+        total_bits: u32,
+    ) -> Option<Self> {
+        if lane_count == 0 || lane_bits == 0 || total_bits == 0 {
+            return None;
+        }
+        if lane_count.saturating_mul(lane_bits) != total_bits {
+            return None;
+        }
+        Some(Self {
+            lane_count,
+            lane_kind,
+            lane_bits,
+            total_bits,
+        })
+    }
+
+    /// Returns `true` when the shape has a valid lane count and width product.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        self.lane_count != 0
+            && self.lane_bits != 0
+            && self.total_bits != 0
+            && self.lane_count.saturating_mul(self.lane_bits) == self.total_bits
+    }
+}
+
+/// Describes the representation used for vector masks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VectorMaskShape {
+    /// Number of predicate lanes in the mask.
+    pub lane_count: u32,
+    /// Number of bits used by each predicate lane.
+    pub lane_bits: u32,
+}
+
+impl VectorMaskShape {
+    /// Creates a vector mask shape when the lane count and lane width are non-zero.
+    #[must_use]
+    pub const fn new(lane_count: u32, lane_bits: u32) -> Option<Self> {
+        if lane_count == 0 || lane_bits == 0 {
+            return None;
+        }
+        Some(Self {
+            lane_count,
+            lane_bits,
+        })
+    }
+
+    /// Returns `true` when the mask has non-zero lane count and lane width.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        self.lane_count != 0 && self.lane_bits != 0
+    }
+}
+
+/// Scales a vector shape relative to the target's runtime vector length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VectorLengthMultiplier {
+    /// Numerator of the vector-length multiplier.
+    pub numerator: u32,
+    /// Denominator of the vector-length multiplier.
+    pub denominator: u32,
+}
+
+impl VectorLengthMultiplier {
+    /// Creates a vector-length multiplier when both parts are non-zero.
+    #[must_use]
+    pub const fn new(numerator: u32, denominator: u32) -> Option<Self> {
+        if numerator == 0 || denominator == 0 {
+            return None;
+        }
+        Some(Self {
+            numerator,
+            denominator,
+        })
+    }
+
+    /// Returns the neutral vector-length multiplier.
+    #[must_use]
+    pub const fn one() -> Self {
+        Self {
+            numerator: 1,
+            denominator: 1,
+        }
+    }
+
+    /// Returns `true` when the multiplier has non-zero parts.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        self.numerator != 0 && self.denominator != 0
+    }
+}
+
+/// Tail-lane behavior for scalable vector operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VectorTailPolicy {
+    /// Inactive tail lanes may take any value.
+    Agnostic,
+    /// Inactive tail lanes preserve their previous value.
+    Undisturbed,
+}
+
+/// Inactive-mask-lane behavior for scalable vector operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VectorMaskPolicy {
+    /// Inactive mask lanes may take any value.
+    Agnostic,
+    /// Inactive mask lanes preserve their previous value.
+    Undisturbed,
+}
+
+/// Describes a scalable vector value whose concrete lane count is runtime-dependent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScalableVectorShape {
+    /// Minimum number of lanes guaranteed by the target type.
+    pub min_lane_count: u32,
+    /// Kind of scalar stored in each lane.
+    pub lane_kind: VectorLaneKind,
+    /// Bit width of each lane.
+    pub lane_bits: u32,
+    /// Runtime vector-length multiplier for this type.
+    pub length_multiplier: VectorLengthMultiplier,
+    /// Tail-lane behavior associated with operations over this type.
+    pub tail_policy: VectorTailPolicy,
+    /// Mask-lane behavior associated with predicated operations over this type.
+    pub mask_policy: VectorMaskPolicy,
+}
+
+impl ScalableVectorShape {
+    /// Creates a scalable vector shape when its lane and multiplier fields are valid.
+    #[must_use]
+    pub const fn new(
+        min_lane_count: u32,
+        lane_kind: VectorLaneKind,
+        lane_bits: u32,
+        length_multiplier: VectorLengthMultiplier,
+        tail_policy: VectorTailPolicy,
+        mask_policy: VectorMaskPolicy,
+    ) -> Option<Self> {
+        if min_lane_count == 0 || lane_bits == 0 || !length_multiplier.is_valid() {
+            return None;
+        }
+        Some(Self {
+            min_lane_count,
+            lane_kind,
+            lane_bits,
+            length_multiplier,
+            tail_policy,
+            mask_policy,
+        })
+    }
+
+    /// Returns `true` when the scalable vector descriptor is structurally valid.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        self.min_lane_count != 0 && self.lane_bits != 0 && self.length_multiplier.is_valid()
+    }
+}
+
+/// Describes a scalable predicate or mask value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScalableVectorMaskShape {
+    /// Minimum number of predicate lanes guaranteed by the target type.
+    pub min_lane_count: u32,
+    /// Number of bits used by each predicate lane.
+    pub lane_bits: u32,
+    /// Runtime vector-length multiplier for this predicate type.
+    pub length_multiplier: VectorLengthMultiplier,
+}
+
+impl ScalableVectorMaskShape {
+    /// Creates a scalable vector mask shape when all fields are non-zero.
+    #[must_use]
+    pub const fn new(
+        min_lane_count: u32,
+        lane_bits: u32,
+        length_multiplier: VectorLengthMultiplier,
+    ) -> Option<Self> {
+        if min_lane_count == 0 || lane_bits == 0 || !length_multiplier.is_valid() {
+            return None;
+        }
+        Some(Self {
+            min_lane_count,
+            lane_bits,
+            length_multiplier,
+        })
+    }
+
+    /// Returns `true` when the scalable mask descriptor is structurally valid.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        self.min_lane_count != 0 && self.lane_bits != 0 && self.length_multiplier.is_valid()
+    }
+}
+
+/// Unified descriptor for fixed-width and scalable vector values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VectorDescriptor {
+    /// Fixed-width vector with a statically known lane count and total width.
+    Fixed(VectorShape),
+    /// Scalable vector with a runtime-dependent lane count.
+    Scalable(ScalableVectorShape),
+}
+
+impl VectorDescriptor {
+    /// Returns the vector lane kind.
+    #[must_use]
+    pub const fn lane_kind(self) -> VectorLaneKind {
+        match self {
+            Self::Fixed(shape) => shape.lane_kind,
+            Self::Scalable(shape) => shape.lane_kind,
+        }
+    }
+
+    /// Returns the vector lane bit width.
+    #[must_use]
+    pub const fn lane_bits(self) -> u32 {
+        match self {
+            Self::Fixed(shape) => shape.lane_bits,
+            Self::Scalable(shape) => shape.lane_bits,
+        }
+    }
+
+    /// Returns the fixed lane count when statically known.
+    #[must_use]
+    pub const fn fixed_lane_count(self) -> Option<u32> {
+        match self {
+            Self::Fixed(shape) => Some(shape.lane_count),
+            Self::Scalable(_) => None,
+        }
+    }
+
+    /// Returns the minimum guaranteed lane count.
+    #[must_use]
+    pub const fn min_lane_count(self) -> u32 {
+        match self {
+            Self::Fixed(shape) => shape.lane_count,
+            Self::Scalable(shape) => shape.min_lane_count,
+        }
+    }
+
+    /// Returns the fixed total bit width when statically known.
+    #[must_use]
+    pub const fn total_bits(self) -> Option<u32> {
+        match self {
+            Self::Fixed(shape) => Some(shape.total_bits),
+            Self::Scalable(_) => None,
+        }
+    }
+
+    /// Returns the canonical mask descriptor for this vector's lane count.
+    #[must_use]
+    pub const fn mask_descriptor(self) -> VectorMaskDescriptor {
+        match self {
+            Self::Fixed(shape) => VectorMaskDescriptor::Fixed(VectorMaskShape {
+                lane_count: shape.lane_count,
+                lane_bits: 1,
+            }),
+            Self::Scalable(shape) => VectorMaskDescriptor::Scalable(ScalableVectorMaskShape {
+                min_lane_count: shape.min_lane_count,
+                lane_bits: 1,
+                length_multiplier: shape.length_multiplier,
+            }),
+        }
+    }
+}
+
+/// Unified descriptor for fixed-width and scalable vector masks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VectorMaskDescriptor {
+    /// Fixed-width mask with a statically known lane count.
+    Fixed(VectorMaskShape),
+    /// Scalable predicate mask with a runtime-dependent lane count.
+    Scalable(ScalableVectorMaskShape),
+}
+
+impl VectorMaskDescriptor {
+    /// Returns the fixed lane count when statically known.
+    #[must_use]
+    pub const fn fixed_lane_count(self) -> Option<u32> {
+        match self {
+            Self::Fixed(shape) => Some(shape.lane_count),
+            Self::Scalable(_) => None,
+        }
+    }
+
+    /// Returns the minimum guaranteed mask lane count.
+    #[must_use]
+    pub const fn min_lane_count(self) -> u32 {
+        match self {
+            Self::Fixed(shape) => shape.lane_count,
+            Self::Scalable(shape) => shape.min_lane_count,
+        }
+    }
+
+    /// Returns the number of bits used by each mask lane.
+    #[must_use]
+    pub const fn lane_bits(self) -> u32 {
+        match self {
+            Self::Fixed(shape) => shape.lane_bits,
+            Self::Scalable(shape) => shape.lane_bits,
+        }
+    }
+}
+
+/// One lane selector in a vector shuffle mask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VectorShuffleLane {
+    /// Produces an undefined lane.
+    Undef,
+    /// Produces a zero lane.
+    Zero,
+    /// Selects a lane from the first vector input.
+    Left(u32),
+    /// Selects a lane from the second vector input.
+    Right(u32),
+}
+
+/// Describes lane selection for one- or two-input vector shuffles.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct VectorShuffleMask {
+    lanes: Vec<VectorShuffleLane>,
+}
+
+impl VectorShuffleMask {
+    /// Creates a shuffle mask from explicit lane selectors.
+    #[must_use]
+    pub fn new(lanes: Vec<VectorShuffleLane>) -> Self {
+        Self { lanes }
+    }
+
+    /// Returns the output lane selectors.
+    #[must_use]
+    pub fn lanes(&self) -> &[VectorShuffleLane] {
+        &self.lanes
+    }
+
+    /// Returns `true` when every selected input lane is in bounds.
+    #[must_use]
+    pub fn is_valid_for(&self, left_lanes: u32, right_lanes: Option<u32>) -> bool {
+        if self.lanes.is_empty() {
+            return false;
+        }
+        self.lanes.iter().all(|lane| match *lane {
+            VectorShuffleLane::Undef | VectorShuffleLane::Zero => true,
+            VectorShuffleLane::Left(idx) => idx < left_lanes,
+            VectorShuffleLane::Right(idx) => right_lanes.is_some_and(|count| idx < count),
+        })
+    }
+}
 
 /// Endianness of a target architecture.
 ///
@@ -349,6 +729,91 @@ pub trait Target: Clone + Debug + Eq + Hash + Sized + 'static {
     /// Bit-width for primitive types where it is statically known. `None` for
     /// pointer-sized integers, references, and aggregates.
     fn bit_width(t: &Self::Type) -> Option<u32>;
+
+    /// Returns `true` if `t` is a vector type known to this target.
+    fn is_vector(t: &Self::Type) -> bool {
+        Self::vector_descriptor(t).is_some()
+    }
+
+    /// Returns the target-independent vector shape for `t`, if known.
+    fn vector_shape(_t: &Self::Type) -> Option<VectorShape> {
+        None
+    }
+
+    /// Returns the scalable vector shape for `t`, if known.
+    fn scalable_vector_shape(_t: &Self::Type) -> Option<ScalableVectorShape> {
+        None
+    }
+
+    /// Returns the fixed or scalable vector descriptor for `t`, if known.
+    fn vector_descriptor(t: &Self::Type) -> Option<VectorDescriptor> {
+        Self::vector_shape(t)
+            .map(VectorDescriptor::Fixed)
+            .or_else(|| Self::scalable_vector_shape(t).map(VectorDescriptor::Scalable))
+    }
+
+    /// Returns the target type for `shape`, if the target supports it.
+    fn vector_type(_shape: VectorShape) -> Option<Self::Type> {
+        None
+    }
+
+    /// Returns the target type for scalable `shape`, if the target supports it.
+    fn scalable_vector_type(_shape: ScalableVectorShape) -> Option<Self::Type> {
+        None
+    }
+
+    /// Returns the scalar lane type for `shape`, if the target supports it.
+    fn vector_lane_type(_shape: VectorShape) -> Option<Self::Type> {
+        None
+    }
+
+    /// Returns the scalar lane type for scalable `shape`, if the target supports it.
+    fn scalable_vector_lane_type(_shape: ScalableVectorShape) -> Option<Self::Type> {
+        None
+    }
+
+    /// Returns the scalar lane type for fixed or scalable `shape`, if supported.
+    fn vector_descriptor_lane_type(shape: VectorDescriptor) -> Option<Self::Type> {
+        match shape {
+            VectorDescriptor::Fixed(shape) => Self::vector_lane_type(shape),
+            VectorDescriptor::Scalable(shape) => Self::scalable_vector_lane_type(shape),
+        }
+    }
+
+    /// Returns the fixed vector mask shape for `t`, if known.
+    fn vector_mask_shape(_t: &Self::Type) -> Option<VectorMaskShape> {
+        None
+    }
+
+    /// Returns the scalable vector mask shape for `t`, if known.
+    fn scalable_vector_mask_shape(_t: &Self::Type) -> Option<ScalableVectorMaskShape> {
+        None
+    }
+
+    /// Returns the fixed or scalable vector mask descriptor for `t`, if known.
+    fn vector_mask_descriptor(t: &Self::Type) -> Option<VectorMaskDescriptor> {
+        Self::vector_mask_shape(t)
+            .map(VectorMaskDescriptor::Fixed)
+            .or_else(|| Self::scalable_vector_mask_shape(t).map(VectorMaskDescriptor::Scalable))
+    }
+
+    /// Returns the target mask type for `shape`, if the target supports it.
+    fn vector_mask_type(_shape: VectorMaskShape) -> Option<Self::Type> {
+        None
+    }
+
+    /// Returns the target scalable mask type for `shape`, if the target supports it.
+    fn scalable_vector_mask_type(_shape: ScalableVectorMaskShape) -> Option<Self::Type> {
+        None
+    }
+
+    /// Returns the target mask type for fixed or scalable `shape`, if supported.
+    fn vector_mask_descriptor_type(shape: VectorMaskDescriptor) -> Option<Self::Type> {
+        match shape {
+            VectorMaskDescriptor::Fixed(shape) => Self::vector_mask_type(shape),
+            VectorMaskDescriptor::Scalable(shape) => Self::scalable_vector_mask_type(shape),
+        }
+    }
 
     /// Mnemonic for the original instruction breadcrumb (e.g. `"add"`, `"ret"`).
     /// Hosts that don't carry a real instruction return a placeholder.

@@ -15,9 +15,9 @@
 //! 2. **Hash-consing**: If the same value key was seen before, the
 //!    later definition is redundant — queue it for replacement.
 //! 3. **Replacement**: For each redundant result, call
-//!    [`SsaFunction::replace_uses_including_phis`] to forward all uses
-//!    (including phi operands) to the original result. Then nop-out the
-//!    redundant instruction so a subsequent DCE run removes it. Nopping
+//!    [`SsaFunction::replace_uses_checked`] to forward safe instruction uses
+//!    to the original result. If no uses remain, nop-out the redundant
+//!    instruction so a subsequent repair or DCE run removes it. Nopping
 //!    (rather than leaving the instruction live) prevents ping-ponging
 //!    with DCE on the next normalization iteration.
 //!
@@ -34,9 +34,10 @@
 use std::collections::HashMap;
 
 use crate::{
+    bitset::BitSet,
     events::{EventKind, EventListener},
     ir::{
-        function::SsaFunction,
+        function::{SsaEditOptions, SsaFunction, SsaRollbackPolicy},
         ops::{BinaryOpKind, SsaOp, UnaryOpKind},
         variable::SsaVarId,
     },
@@ -152,26 +153,76 @@ where
     }
 
     let mut total_replaced: usize = 0;
-    for (redundant_var, original_var, block_idx, instr_idx) in &redundant {
-        let result = ssa.replace_uses_including_phis(*redundant_var, *original_var);
-        if result.replaced > 0 {
-            let event = crate::events::Event {
-                kind: EventKind::ConstantFolded,
-                method: Some(method.clone()),
-                location: None,
-                message: format!(
-                    "GVN: {redundant_var} → {original_var} ({} uses)",
-                    result.replaced
-                ),
-                pass: None,
-            };
-            events.push(event);
-            total_replaced = total_replaced.saturating_add(result.replaced);
-        }
-        ssa.remove_instruction(*block_idx, *instr_idx);
+    let mut removals: Vec<(usize, usize)> = Vec::new();
+    let rollback = if cfg!(debug_assertions) {
+        SsaRollbackPolicy::OnFailure
+    } else {
+        SsaRollbackPolicy::Never
+    };
+    let edit_result = ssa.edit(
+        SsaEditOptions::new()
+            .with_verify(cfg!(debug_assertions))
+            .with_rollback(rollback),
+        |editor| {
+            for (redundant_var, original_var, _block_idx, _instr_idx) in &redundant {
+                let result = editor.replace_uses_checked(*redundant_var, *original_var);
+                if result.replaced > 0 {
+                    let event = crate::events::Event {
+                        kind: EventKind::ConstantFolded,
+                        method: Some(method.clone()),
+                        location: None,
+                        message: format!(
+                            "GVN: {redundant_var} → {original_var} ({} uses)",
+                            result.replaced
+                        ),
+                        pass: None,
+                    };
+                    events.push(event);
+                    total_replaced = total_replaced.saturating_add(result.replaced);
+                }
+            }
+
+            // Decide removals in a single pass over the post-replacement
+            // function instead of rescanning the whole function per redundant
+            // variable (which was O(redundant * instructions)).
+            let used = collect_used_vars(editor.function());
+            for (redundant_var, _original_var, block_idx, instr_idx) in &redundant {
+                if !used.contains(redundant_var.index()) {
+                    removals.push((*block_idx, *instr_idx));
+                }
+            }
+
+            for (block_idx, instr_idx) in &removals {
+                editor.nop_instruction(*block_idx, *instr_idx)?;
+            }
+            Ok(())
+        },
+    );
+
+    if edit_result.is_err() {
+        return 0;
     }
 
     total_replaced
+}
+
+/// Collects, in a single pass, the set of variables still referenced by any
+/// instruction operand or phi operand (indexed by `SsaVarId::index()`).
+fn collect_used_vars<T: Target>(ssa: &SsaFunction<T>) -> BitSet {
+    let mut used = BitSet::new(ssa.var_id_capacity());
+    for block in ssa.blocks() {
+        for instr in block.instructions() {
+            instr.op().for_each_use(|v| {
+                used.insert(v.index());
+            });
+        }
+        for phi in block.phi_nodes() {
+            for operand in phi.operands() {
+                used.insert(operand.value().index());
+            }
+        }
+    }
+    used
 }
 
 #[cfg(test)]
@@ -186,7 +237,10 @@ mod tests {
             value::ConstValue,
             variable::{DefSite, VariableOrigin},
         },
-        testing::{MockTarget, MockType},
+        testing::{
+            assert_mock_valid_full, mock_op_at, run_mock_pass_repaired_boundary, MockTarget,
+            MockType,
+        },
     };
 
     #[test]
@@ -208,8 +262,8 @@ mod tests {
             right: v0,
             flags: None,
         };
-        let (k1, _) = ValueKey::from_op(&add_op1).unwrap();
-        let (k2, _) = ValueKey::from_op(&add_op2).unwrap();
+        let (k1, _) = ValueKey::from_op(&add_op1).expect("add should produce a value key");
+        let (k2, _) = ValueKey::from_op(&add_op2).expect("add should produce a value key");
         assert_eq!(k1, k2, "Add should be commutative");
 
         let sub_op1: SsaOp<MockTarget> = SsaOp::Sub {
@@ -224,8 +278,8 @@ mod tests {
             right: v0,
             flags: None,
         };
-        let (k3, _) = ValueKey::from_op(&sub_op1).unwrap();
-        let (k4, _) = ValueKey::from_op(&sub_op2).unwrap();
+        let (k3, _) = ValueKey::from_op(&sub_op1).expect("sub should produce a value key");
+        let (k4, _) = ValueKey::from_op(&sub_op2).expect("sub should produce a value key");
         assert_ne!(k3, k4, "Sub should NOT be commutative");
     }
 
@@ -241,7 +295,7 @@ mod tests {
             right: v1,
             flags: None,
         };
-        let (key, dest) = ValueKey::from_op(&add_op).unwrap();
+        let (key, dest) = ValueKey::from_op(&add_op).expect("add should produce a value key");
         assert_eq!(dest, v2);
         assert!(matches!(key, ValueKey::Binary(BinaryOpKind::Add, _, _, _)));
 
@@ -250,7 +304,7 @@ mod tests {
             operand: v0,
             flags: None,
         };
-        let (key, dest) = ValueKey::from_op(&neg_op).unwrap();
+        let (key, dest) = ValueKey::from_op(&neg_op).expect("neg should produce a value key");
         assert_eq!(dest, v1);
         assert!(matches!(key, ValueKey::Unary(UnaryOpKind::Neg, _)));
 
@@ -315,10 +369,11 @@ mod tests {
         let replaced = run_gvn(&mut ssa, &method, &log);
         assert!(replaced > 0);
         assert!(!log.is_empty());
+        ssa.repair_ssa();
+        assert_mock_valid_full(&ssa, "identical binop after GVN repair");
 
         // mul should now reference v2 twice instead of (v2, v3).
-        let mul_instr = ssa.block(0).unwrap().instructions().last().unwrap();
-        match mul_instr.op() {
+        match mock_op_at(&ssa, 0, 3) {
             SsaOp::Mul { left, right, .. } => {
                 assert_eq!(*left, v2);
                 assert_eq!(*right, v2);
@@ -381,7 +436,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0xABu32;
-        let changed = run(&mut ssa, &method, &log);
+        let changed = run_mock_pass_repaired_boundary(&mut ssa, "cross-block GVN", |ssa| {
+            run(ssa, &method, &log)
+        });
         assert!(
             changed,
             "duplicate expression across blocks should be eliminated"
@@ -433,11 +490,13 @@ mod tests {
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
         // v2 and v3 are different computations — GVN should NOT eliminate either
-        let _ = run(&mut ssa, &method, &log);
+        let changed = run_mock_pass_repaired_boundary(&mut ssa, "non-commutative GVN", |ssa| {
+            run(ssa, &method, &log)
+        });
+        assert!(!changed, "swapped non-commutative ops must not be merged");
         // v3's Sub should still be present (not Nop'd)
-        let third_instr = ssa.block(0).unwrap().instruction(3).unwrap();
         assert!(
-            matches!(third_instr.op(), SsaOp::Sub { .. }),
+            matches!(mock_op_at(&ssa, 0, 3), SsaOp::Sub { .. }),
             "non-commutative swapped sub should NOT be nop'd"
         );
     }
@@ -445,7 +504,7 @@ mod tests {
     #[test]
     fn gvn_skips_impure_operations() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 3);
-        for i in 0..3 {
+        for i in 0..4 {
             ssa.create_variable(
                 VariableOrigin::Local(i as u16),
                 0,
@@ -456,6 +515,7 @@ mod tests {
         let v0 = SsaVarId::from_index(0);
         let v1 = SsaVarId::from_index(1);
         let v2 = SsaVarId::from_index(2);
+        let v3 = SsaVarId::from_index(3);
 
         let mut block = SsaBlock::new(0);
         block.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
@@ -475,7 +535,7 @@ mod tests {
             flags: None,
         }));
         block.add_instruction(SsaInstruction::synthetic(SsaOp::AddOvf {
-            dest: SsaVarId::from_index(3),
+            dest: v3,
             left: v0,
             right: v1,
             unsigned: false,
@@ -487,16 +547,12 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let _ = run(&mut ssa, &method, &log);
+        let changed =
+            run_mock_pass_repaired_boundary(&mut ssa, "impure GVN", |ssa| run(ssa, &method, &log));
+        assert!(!changed, "throwing overflow ops must not be value numbered");
         // Neither AddOvf should be nop'd
-        assert!(matches!(
-            ssa.block(0).unwrap().instruction(2).unwrap().op(),
-            SsaOp::AddOvf { .. }
-        ));
-        assert!(matches!(
-            ssa.block(0).unwrap().instruction(3).unwrap().op(),
-            SsaOp::AddOvf { .. }
-        ));
+        assert!(matches!(mock_op_at(&ssa, 0, 2), SsaOp::AddOvf { .. }));
+        assert!(matches!(mock_op_at(&ssa, 0, 3), SsaOp::AddOvf { .. }));
     }
 
     #[test]
@@ -535,7 +591,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log);
+        let changed = run_mock_pass_repaired_boundary(&mut ssa, "no-duplicate GVN", |ssa| {
+            run(ssa, &method, &log)
+        });
         assert!(!changed, "no duplicates should return false");
     }
 
@@ -562,27 +620,21 @@ mod tests {
     fn identical_loadargs_are_value_numbered() {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(2, 2);
         let v0 = ssa.create_variable(
-            VariableOrigin::Argument(0),
-            0,
-            DefSite::entry(),
-            MockType::I32,
-        );
-        let v1 = ssa.create_variable(
-            VariableOrigin::Argument(1),
-            0,
-            DefSite::entry(),
-            MockType::I32,
-        );
-        let v2 = ssa.create_variable(
             VariableOrigin::Local(0),
             0,
             DefSite::instruction(0, 0),
             MockType::I32,
         );
-        let _v3 = ssa.create_variable(
+        let v1 = ssa.create_variable(
             VariableOrigin::Local(1),
             0,
             DefSite::instruction(0, 1),
+            MockType::I32,
+        );
+        let v2 = ssa.create_variable(
+            VariableOrigin::Local(2),
+            0,
+            DefSite::instruction(0, 2),
             MockType::I32,
         );
 
@@ -607,8 +659,102 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log);
+        let changed =
+            run_mock_pass_repaired_boundary(&mut ssa, "loadarg GVN", |ssa| run(ssa, &method, &log));
         assert!(changed, "identical LoadArgs should be value numbered");
+    }
+
+    #[test]
+    fn gvn_does_not_forward_from_non_dominating_block() {
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 6);
+        let cond = ssa.create_variable(
+            VariableOrigin::Local(0),
+            0,
+            DefSite::instruction(0, 0),
+            MockType::I32,
+        );
+        let left = ssa.create_variable(
+            VariableOrigin::Local(1),
+            0,
+            DefSite::instruction(0, 1),
+            MockType::I32,
+        );
+        let right = ssa.create_variable(
+            VariableOrigin::Local(2),
+            0,
+            DefSite::instruction(0, 2),
+            MockType::I32,
+        );
+        let original = ssa.create_variable(
+            VariableOrigin::Local(3),
+            0,
+            DefSite::instruction(1, 0),
+            MockType::I32,
+        );
+        let duplicate = ssa.create_variable(
+            VariableOrigin::Local(4),
+            0,
+            DefSite::instruction(2, 0),
+            MockType::I32,
+        );
+
+        let mut entry = SsaBlock::new(0);
+        entry.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: cond,
+            value: ConstValue::I32(1),
+        }));
+        entry.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: left,
+            value: ConstValue::I32(2),
+        }));
+        entry.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+            dest: right,
+            value: ConstValue::I32(3),
+        }));
+        entry.add_instruction(SsaInstruction::synthetic(SsaOp::Branch {
+            condition: cond,
+            true_target: 1,
+            false_target: 2,
+        }));
+
+        let mut true_block = SsaBlock::new(1);
+        true_block.add_instruction(SsaInstruction::synthetic(SsaOp::Add {
+            dest: original,
+            left,
+            right,
+            flags: None,
+        }));
+        true_block.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
+            value: Some(original),
+        }));
+
+        let mut false_block = SsaBlock::new(2);
+        false_block.add_instruction(SsaInstruction::synthetic(SsaOp::Add {
+            dest: duplicate,
+            left,
+            right,
+            flags: None,
+        }));
+        false_block.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
+            value: Some(duplicate),
+        }));
+
+        ssa.add_block(entry);
+        ssa.add_block(true_block);
+        ssa.add_block(false_block);
+        ssa.recompute_uses();
+
+        let log: EventLog<MockTarget> = EventLog::new();
+        let method = 0u32;
+        let changed = run_mock_pass_repaired_boundary(&mut ssa, "non-dominating GVN", |ssa| {
+            run(ssa, &method, &log)
+        });
+
+        assert!(
+            !changed,
+            "GVN must not forward from a sibling branch that does not dominate the use"
+        );
+        assert!(matches!(mock_op_at(&ssa, 2, 0), SsaOp::Add { .. }));
     }
 
     #[test]
@@ -676,7 +822,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log);
+        let changed = run_mock_pass_repaired_boundary(&mut ssa, "multi-level GVN", |ssa| {
+            run(ssa, &method, &log)
+        });
         assert!(changed, "multi-level duplicates should be eliminated");
     }
 }

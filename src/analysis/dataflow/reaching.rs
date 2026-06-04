@@ -95,7 +95,7 @@ impl ReachingDefinitions {
 
             // Instructions may define variables
             for instr in block.instructions() {
-                if let Some(def) = instr.def() {
+                for def in instr.defs() {
                     if let Some(idx) = ssa.var_index(def) {
                         gen.insert(idx);
                     }
@@ -222,8 +222,8 @@ impl MeetSemiLattice for ReachingDefsResult {
     }
 
     fn is_bottom(&self) -> bool {
-        // Bottom is when all definitions reach (full set)
-        self.defs.count() == self.defs.len()
+        // Bottom is when all definitions reach (full set).
+        self.defs.is_full()
     }
 }
 

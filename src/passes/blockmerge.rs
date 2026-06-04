@@ -36,12 +36,15 @@
 //!
 //! O(n * max_iterations) where n is the number of blocks.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::{
     bitset::BitSet,
     events::{EventKind, EventListener},
-    ir::{function::SsaFunction, instruction::SsaInstruction, ops::SsaOp, phi::PhiOperand},
+    ir::{
+        function::{SsaEditOptions, SsaEditor, SsaFunction},
+        ops::SsaOp,
+    },
     passes::utils::resolve_chain,
     target::Target,
 };
@@ -113,13 +116,21 @@ where
     if trampolines.is_empty() {
         return 0;
     }
-    let redirected = redirect_to_ultimate_targets(ssa, &trampolines, method, events);
-    let cleared = clear_trampolines(ssa, &trampolines, method, events);
+    let mut redirected = 0usize;
+    let mut cleared = 0usize;
+    let result = ssa.edit(SsaEditOptions::new(), |editor| {
+        redirected = redirect_to_ultimate_targets(editor, &trampolines, method, events);
+        cleared = clear_trampolines(editor, &trampolines, method, events);
+        Ok(())
+    });
+    if result.is_err() {
+        return 0;
+    }
     redirected.saturating_add(cleared)
 }
 
 fn redirect_to_ultimate_targets<T, L>(
-    ssa: &mut SsaFunction<T>,
+    editor: &mut SsaEditor<T>,
     trampolines: &BTreeMap<usize, usize>,
     method: &T::MethodRef,
     events: &L,
@@ -142,71 +153,68 @@ where
     let mut redirected_preds: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
     let mut redirected: usize = 0;
 
-    let block_count = ssa.block_count();
+    let block_count = editor.function().block_count();
     for block_idx in 0..block_count {
-        if let Some(block) = ssa.block_mut(block_idx) {
-            for instr in block.instructions_mut() {
-                let op = instr.op_mut();
-                let old_targets = op.successors();
-                let mut changed = false;
-                for (&trampoline, &ultimate) in &ultimate_targets {
-                    if op.redirect_target(trampoline, ultimate) {
-                        redirected_preds
-                            .entry((trampoline, ultimate))
-                            .or_default()
-                            .push(block_idx);
-                        changed = true;
-                    }
-                }
-                if changed {
-                    let new_targets = op.successors();
-                    let event = crate::events::Event {
-                        kind: EventKind::BranchSimplified,
-                        method: Some(method.clone()),
-                        location: Some(block_idx),
-                        message: format!(
-                            "redirected through trampoline: {old_targets:?} -> {new_targets:?}"
-                        ),
-                        pass: None,
-                    };
-                    events.push(event);
-                    redirected = redirected.saturating_add(1);
-                }
+        let Some(old_targets) = editor
+            .function()
+            .block(block_idx)
+            .and_then(|block| block.terminator_op())
+            .map(SsaOp::successors)
+        else {
+            continue;
+        };
+
+        // Only this block's actual successors can be trampolines, so look each
+        // one up directly instead of trying every trampoline (which made this
+        // O(blocks * trampolines)).
+        let mut changed = false;
+        for &target in &old_targets {
+            let Some(&ultimate) = ultimate_targets.get(&target) else {
+                continue;
+            };
+            if editor
+                .redirect_terminator_target(block_idx, target, ultimate)
+                .unwrap_or(false)
+            {
+                redirected_preds
+                    .entry((target, ultimate))
+                    .or_default()
+                    .push(block_idx);
+                changed = true;
             }
+        }
+
+        if changed {
+            let new_targets = editor
+                .function()
+                .block(block_idx)
+                .and_then(|block| block.terminator_op())
+                .map(SsaOp::successors)
+                .unwrap_or_default();
+            let event = crate::events::Event {
+                kind: EventKind::BranchSimplified,
+                method: Some(method.clone()),
+                location: Some(block_idx),
+                message: format!(
+                    "redirected through trampoline: {old_targets:?} -> {new_targets:?}"
+                ),
+                pass: None,
+            };
+            events.push(event);
+            redirected = redirected.saturating_add(1);
         }
     }
 
     // Update phi operands at ultimate target blocks.
     for (&(trampoline, ultimate), preds) in &redirected_preds {
-        if let Some(target_block) = ssa.block_mut(ultimate) {
-            for phi in target_block.phi_nodes_mut() {
-                let trampoline_operand = phi
-                    .operands()
-                    .iter()
-                    .find(|op| op.predecessor() == trampoline)
-                    .map(|op| op.value());
-                if let Some(value) = trampoline_operand {
-                    if let Some(&first_pred) = preds.first() {
-                        for operand in phi.operands_mut() {
-                            if operand.predecessor() == trampoline {
-                                operand.set_predecessor(first_pred);
-                                break;
-                            }
-                        }
-                    }
-                    for &pred in preds.iter().skip(1) {
-                        phi.add_operand(PhiOperand::new(value, pred));
-                    }
-                }
-            }
-        }
+        let _ = editor.expand_phi_predecessor(ultimate, trampoline, preds);
     }
 
     redirected
 }
 
 fn clear_trampolines<T, L>(
-    ssa: &mut SsaFunction<T>,
+    editor: &mut SsaEditor<T>,
     trampolines: &BTreeMap<usize, usize>,
     method: &T::MethodRef,
     events: &L,
@@ -217,19 +225,16 @@ where
 {
     let mut cleared: usize = 0;
     for &block_idx in trampolines.keys() {
-        if let Some(block) = ssa.block_mut(block_idx) {
-            if !block.instructions().is_empty() {
-                block.instructions_mut().clear();
-                let event = crate::events::Event {
-                    kind: EventKind::BlockRemoved,
-                    method: Some(method.clone()),
-                    location: Some(block_idx),
-                    message: format!("cleared trampoline block B{block_idx}"),
-                    pass: None,
-                };
-                events.push(event);
-                cleared = cleared.saturating_add(1);
-            }
+        if editor.clear_block(block_idx).unwrap_or(false) {
+            let event = crate::events::Event {
+                kind: EventKind::BlockRemoved,
+                method: Some(method.clone()),
+                location: Some(block_idx),
+                message: format!("cleared trampoline block B{block_idx}"),
+                pass: None,
+            };
+            events.push(event);
+            cleared = cleared.saturating_add(1);
         }
     }
     cleared
@@ -264,15 +269,34 @@ where
             .map(|b| b.instructions().to_vec())
             .unwrap_or_default();
 
-        if let Some(entry) = ssa.block_mut(0) {
-            entry.instructions_mut().clear();
-            *entry.instructions_mut() = target_instrs;
-            for instr in entry.instructions_mut() {
-                instr.op_mut().redirect_target(target, 0);
+        let result = ssa.edit(SsaEditOptions::new(), |editor| {
+            editor.remove_instruction_tail(0, 0)?;
+            for (instr_idx, instr) in target_instrs.iter().cloned().enumerate() {
+                editor.insert_instruction(0, instr_idx, instr)?;
             }
-        }
-        if let Some(target_block) = ssa.block_mut(target) {
-            target_block.instructions_mut().clear();
+            let entry_len = editor
+                .function()
+                .block(0)
+                .map(|block| block.instructions().len())
+                .unwrap_or(0);
+            for instr_idx in 0..entry_len {
+                let Some(mut op) = editor
+                    .function()
+                    .block(0)
+                    .and_then(|block| block.instruction(instr_idx))
+                    .map(|instr| instr.op().clone())
+                else {
+                    continue;
+                };
+                if op.redirect_target(target, 0) {
+                    editor.replace_instruction_op(0, instr_idx, op)?;
+                }
+            }
+            editor.clear_block(target)?;
+            Ok(())
+        });
+        if result.is_err() {
+            return false;
         }
         let event = crate::events::Event {
             kind: EventKind::BlockRemoved,
@@ -383,6 +407,9 @@ where
             if no_merge_from.contains(a_idx) || no_merge_into.contains(b_idx) {
                 continue;
             }
+            if block_reaches(ssa, b_idx, a_idx) {
+                continue;
+            }
             let b_empty = ssa.block(b_idx).is_none_or(|b| b.instructions().is_empty());
             if b_empty {
                 continue;
@@ -392,83 +419,26 @@ where
             consumed.insert(b_idx);
         }
 
-        for (a_idx, b_idx) in pairs {
-            // Convert B's phi nodes to Copy instructions (single predecessor).
-            let phi_copies: Vec<SsaInstruction<T>> = ssa
-                .block(b_idx)
-                .map(|b| {
-                    b.phi_nodes()
-                        .iter()
-                        .filter_map(|phi| {
-                            let operand = phi.operands().first()?;
-                            let dest = phi.result();
-                            let src = operand.value();
-                            if dest == src {
-                                return None;
-                            }
-                            Some(SsaInstruction::synthetic(SsaOp::Copy { dest, src }))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let b_instrs: Vec<SsaInstruction<T>> = ssa
-                .block(b_idx)
-                .map(|b| b.instructions().to_vec())
-                .unwrap_or_default();
-
-            // Remove A's terminator and append phi copies + B's instructions.
-            if let Some(a_block) = ssa.block_mut(a_idx) {
-                let instrs = a_block.instructions_mut();
-                if instrs
-                    .last()
-                    .is_some_and(|i| matches!(i.op(), SsaOp::Jump { .. }))
-                {
-                    instrs.pop();
-                }
-                instrs.extend(phi_copies);
-                instrs.extend(b_instrs);
-            }
-
-            // Update self-references inside the merged code (B → A).
-            if let Some(a_block) = ssa.block_mut(a_idx) {
-                for instr in a_block.instructions_mut() {
-                    instr.op_mut().redirect_target(b_idx, a_idx);
-                }
-            }
-
-            // Clear B.
-            if let Some(b_block) = ssa.block_mut(b_idx) {
-                b_block.phi_nodes_mut().clear();
-                b_block.instructions_mut().clear();
-            }
-
-            // Redirect any phi operand that referenced B to reference A.
-            for phi_block_idx in 0..block_count {
-                if phi_block_idx == a_idx || phi_block_idx == b_idx {
-                    continue;
-                }
-                if let Some(block) = ssa.block_mut(phi_block_idx) {
-                    for phi in block.phi_nodes_mut() {
-                        for operand in phi.operands_mut() {
-                            if operand.predecessor() == b_idx {
-                                *operand = PhiOperand::new(operand.value(), a_idx);
-                            }
-                        }
+        if !pairs.is_empty() {
+            let result = ssa.edit(SsaEditOptions::new(), |editor| {
+                for &(a_idx, b_idx) in &pairs {
+                    if editor.coalesce_unconditional_successor(a_idx, b_idx)? {
+                        let event = crate::events::Event {
+                            kind: EventKind::BlockRemoved,
+                            method: Some(method.clone()),
+                            location: Some(b_idx),
+                            message: format!("coalesced B{b_idx} into B{a_idx}"),
+                            pass: None,
+                        };
+                        events.push(event);
+                        iteration_merges = iteration_merges.saturating_add(1);
                     }
                 }
+                Ok(())
+            });
+            if result.is_err() {
+                iteration_merges = 0;
             }
-
-            let event = crate::events::Event {
-                kind: EventKind::BlockRemoved,
-                method: Some(method.clone()),
-                location: Some(b_idx),
-                message: format!("coalesced B{b_idx} into B{a_idx}"),
-                pass: None,
-            };
-            events.push(event);
-
-            iteration_merges = iteration_merges.saturating_add(1);
         }
 
         merged = merged.saturating_add(iteration_merges);
@@ -478,6 +448,35 @@ where
     }
 
     merged
+}
+
+fn block_reaches<T: Target>(ssa: &SsaFunction<T>, start: usize, target: usize) -> bool {
+    if start >= ssa.block_count() || target >= ssa.block_count() {
+        return false;
+    }
+
+    let mut visited = BitSet::new(ssa.block_count());
+    let mut worklist = VecDeque::new();
+    worklist.push_back(start);
+    visited.insert(start);
+
+    while let Some(block_idx) = worklist.pop_front() {
+        let successors = ssa
+            .block(block_idx)
+            .and_then(|block| block.terminator_op())
+            .map(SsaOp::successors)
+            .unwrap_or_default();
+        for successor in successors {
+            if successor == target {
+                return true;
+            }
+            if successor < ssa.block_count() && visited.insert(successor) {
+                worklist.push_back(successor);
+            }
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -493,7 +492,7 @@ mod tests {
             value::ConstValue,
             variable::{DefSite, SsaVarId, VariableOrigin},
         },
-        testing::{MockTarget, MockType},
+        testing::{run_mock_pass_boundary, MockTarget, MockType},
     };
 
     fn instr(op: SsaOp<MockTarget>) -> SsaInstruction<MockTarget> {
@@ -535,7 +534,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 10);
+        let changed = run_mock_pass_boundary(&mut ssa, "simple block merge", |ssa| {
+            run(ssa, &method, &log, 10)
+        });
         assert!(changed);
         // B1 trampoline should be eliminated
         assert!(log.has(EventKind::BranchSimplified) || log.has(EventKind::BlockRemoved));
@@ -564,7 +565,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 10);
+        let changed = run_mock_pass_boundary(&mut ssa, "trampoline chain block merge", |ssa| {
+            run(ssa, &method, &log, 10)
+        });
         assert!(changed, "chain of trampolines should be eliminated");
     }
 
@@ -588,7 +591,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 10);
+        let changed = run_mock_pass_boundary(&mut ssa, "sequential block coalescing", |ssa| {
+            run(ssa, &method, &log, 10)
+        });
         assert!(changed, "sequential blocks should coalesce");
     }
 
@@ -615,7 +620,6 @@ mod tests {
         ssa.add_block(b1);
         let mut b2 = SsaBlock::new(2);
         let mut phi = PhiNode::new(phi_var, VariableOrigin::Local(2));
-        phi.add_operand(PhiOperand::new(v0, 0));
         phi.add_operand(PhiOperand::new(v1, 1));
         b2.add_phi(phi);
         b2.add_instruction(instr(SsaOp::Return {
@@ -626,8 +630,10 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 10);
-        let _ = changed;
+        let changed = run_mock_pass_boundary(&mut ssa, "phi operand block coalescing", |ssa| {
+            run(ssa, &method, &log, 10)
+        });
+        assert!(changed, "coalescing should preserve phi operands");
     }
 
     #[test]
@@ -648,7 +654,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 10);
+        let changed = run_mock_pass_boundary(&mut ssa, "entry trampoline block merge", |ssa| {
+            run(ssa, &method, &log, 10)
+        });
         assert!(changed, "entry trampoline should be handled");
     }
 
@@ -657,7 +665,9 @@ mod tests {
         let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 0);
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 10);
+        let changed = run_mock_pass_boundary(&mut ssa, "empty block merge", |ssa| {
+            run(ssa, &method, &log, 10)
+        });
         assert!(!changed);
     }
 
@@ -676,7 +686,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let changed = run(&mut ssa, &method, &log, 10);
+        let changed = run_mock_pass_boundary(&mut ssa, "no-trampoline block merge", |ssa| {
+            run(ssa, &method, &log, 10)
+        });
         assert!(!changed, "no trampolines should mean no changes");
     }
 
@@ -713,6 +725,9 @@ mod tests {
 
         let log: EventLog<MockTarget> = EventLog::new();
         let method = 0u32;
-        let _ = run(&mut ssa, &method, &log, 10);
+        let changed = run_mock_pass_boundary(&mut ssa, "phi successor trampoline merge", |ssa| {
+            run(ssa, &method, &log, 10)
+        });
+        assert!(changed, "trampoline with phi successor should be handled");
     }
 }

@@ -171,7 +171,17 @@ impl<'a, T: Target> PatternDetector<'a, T> {
         // Identify state variables (inputs to the dispatch computation)
         let state_vars = dispatch_expr
             .as_ref()
-            .map(|e| e.variables().into_iter().collect())
+            .map(|e| {
+                // Collect referenced variables without allocating a HashSet;
+                // dispatch expressions are small so the linear dedup is cheap.
+                let mut vars: Vec<SsaVarId> = Vec::new();
+                e.for_each_variable(|v| {
+                    if !vars.contains(&v) {
+                        vars.push(v);
+                    }
+                });
+                vars
+            })
             .unwrap_or_default();
 
         Some(DispatcherPattern {
