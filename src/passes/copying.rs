@@ -14,8 +14,9 @@
 //!    defined later in the same block than an existing destination use.
 //! 4. **Resolve chains**: replace `dest → src` pairs with
 //!    `dest → ultimate_src` using [`resolve_chain`].
-//! 5. **Propagate**: call [`SsaFunction::propagate_copies`] to rewrite all
-//!    uses of dest variables to their ultimate sources.
+//! 5. **Propagate**: call
+//!    [`SsaEditor::propagate_copies`](crate::ir::function::SsaEditor::propagate_copies)
+//!    to rewrite all uses of dest variables to their ultimate sources.
 //! 6. **Nop out and repair**: replace fully propagated copy-defining
 //!    instructions with `Nop`, strip those nops, compact the variable table,
 //!    and recompute use lists so the pass does not leave orphan variables.
