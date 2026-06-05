@@ -4,6 +4,55 @@ All notable changes to this crate are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Loop-pass convergence and complexity fixes. On control-flow-flattened inputs
+(many small nested loops with long invariant chains) the normalization pipeline
+previously ran its loop passes to the iteration cap without converging and spent
+super-linear time per call; these changes make it converge in a couple of
+iterations with output unchanged.
+
+### Fixed
+
+- LICM now converges on functions with deep loop-invariant dependency chains.
+  The hoist phase moved only one dependency "wave" per invocation — leaving
+  dependent invariants for a later call — so deeply-chained invariants in large
+  loops needed O(chain-depth) expensive invocations and routinely exhausted the
+  driving fixpoint's iteration cap with work still pending. It now hoists a
+  loop's entire invariant chain in one pass, inserting in topological order so a
+  hoisted definition always precedes its hoisted uses.
+- Loop canonicalization no longer oscillates against CFG simplification.
+  `controlflow` (jump threading) and `blockmerge` (trampoline elimination) now
+  preserve canonical loop preheaders and unified latches instead of removing
+  them as empty forwarding blocks — which `loopcanon` immediately re-inserted,
+  so the normalization fixpoint never settled. Loop-simplify form is now stable
+  (the same trade-off LLVM's `simplifycfg` makes).
+
+### Performance
+
+- LICM `can_hoist` is O(1) per candidate instead of O(loop). The
+  "result feeds a phi on a loop back-edge" test is precomputed once per loop as a
+  single backward taint propagation seeded from the back-edge phi operands,
+  replacing a fresh forward def-use traversal per candidate
+  (O(candidates × loop) → O(loop)).
+- LICM invariant detection and hoist-availability no longer scan every variable
+  in the function once per loop; the loop-body-defined variable set is built once
+  per loop in O(loop-body) (O(loops × variables) → O(loops × loop-body)).
+- Loop canonicalization re-analyzes the loop forest once per pass instead of once
+  per transformation: each pass now canonicalizes every loop the forest reports
+  (still one transformation per loop per pass, preserving phi-management
+  simplicity), turning O(transformations × loop-analysis) into
+  O(passes × loop-analysis).
+- GVN builds the CFG and dominator tree once per run rather than rebuilding it
+  (and rescanning every block) for each redundant value pair.
+
+### Added
+
+- `SsaEditor::replace_uses_checked_with` — replace instruction uses against a
+  caller-supplied dominator tree, letting a pass that rewrites many variables
+  (e.g. GVN) build the tree once and reuse it across the whole batch instead of
+  per replacement.
+
 ## [0.2.0] - 2026-06-03
 
 Major release: a target-agnostic **native SSA substrate** for modern lifters,

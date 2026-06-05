@@ -25,11 +25,14 @@
 //!
 //! # Algorithm
 //!
-//! Repeatedly analyzes loop structure via [`SsaFunction::analyze_loops`],
-//! processing loops innermost-first. For each non-canonical loop, either
-//! inserts a preheader or unifies latches (one transformation per iteration
-//! to keep phi management simple). After all loops are canonical,
-//! [`SsaFunction::canonicalize`] is called.
+//! Repeatedly analyzes loop structure via [`SsaFunction::analyze_loops`]. Each
+//! pass canonicalizes *every* loop the forest reports, innermost-first, applying
+//! at most one transformation per loop (preheader insertion takes priority over
+//! latch unification) so phi management stays simple; a loop needing both is
+//! finished on the next pass. Because every transformation is local to its own
+//! loop, the forest is re-analyzed once per pass rather than once per individual
+//! transformation. After all loops are canonical, [`SsaFunction::canonicalize`]
+//! is called.
 
 use std::collections::HashMap;
 
@@ -101,13 +104,12 @@ where
                 if non_loop_preds.len() > 1 {
                     insert_preheader(ssa, loop_info, &non_loop_preds, method, events);
                     modified_this_iteration = modified_this_iteration.saturating_add(1);
-                    break;
+                    continue;
                 }
             }
             if !loop_info.has_single_latch() && loop_info.latches.len() > 1 {
                 unify_latches(ssa, loop_info, method, events);
                 modified_this_iteration = modified_this_iteration.saturating_add(1);
-                break;
             }
         }
 

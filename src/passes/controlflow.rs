@@ -29,7 +29,10 @@ use crate::{
         function::{SsaEditOptions, SsaEditor, SsaFunction},
         ops::SsaOp,
     },
-    passes::{deadcode::find_dead_tails, utils::resolve_chain},
+    passes::{
+        deadcode::find_dead_tails,
+        utils::{loop_canonical_blocks, resolve_chain},
+    },
     target::Target,
 };
 
@@ -91,7 +94,13 @@ where
     let mut total_changes: usize = 0;
 
     // Step 1: find jump threading targets (don't skip entry block).
-    let trampolines = ssa.find_trampoline_blocks(false);
+    let mut trampolines = ssa.find_trampoline_blocks(false);
+
+    // Preserve canonical loop preheaders: threading through them re-exposes a
+    // loop header's multiple non-loop predecessors, which the loop canonicalizer
+    // immediately re-funnels through a fresh preheader — an endless oscillation.
+    let preheaders = loop_canonical_blocks(ssa);
+    trampolines.retain(|block, _| !preheaders.contains(block));
 
     // Step 2: find branches to same target (also resolves through trampolines).
     let same_target_branches = find_same_target_branches(ssa, &trampolines);

@@ -14,8 +14,10 @@
 //!    operand on an intra-loop back-edge (would collapse per-edge
 //!    attribution), and reject instructions whose removal would leave
 //!    a trampoline block whose successor has phis.
-//!    c. Insert invariants just before the preheader's terminator,
-//!    preserving original definition order.
+//!    c. Hoist the whole invariant dependency chain in a single pass,
+//!    inserting instructions just before the preheader's terminator in
+//!    topological (data-dependency) order so a hoisted def always precedes
+//!    its hoisted uses.
 //!    d. Replace original instructions with `Nop`.
 //!    e. If a source block is now a trampoline, redirect successor phi
 //!    operands from the source block to the preheader.
@@ -30,7 +32,10 @@
 //! - Avoids creating trampoline blocks whose successor has phis (phi
 //!   stability across subsequent block merging).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
+};
 
 use crate::{
     analysis::{loop_analyzer::LoopAnalyzer, loops::LoopInfo},
@@ -98,22 +103,18 @@ where
             continue;
         }
 
-        let invariants = find_loop_invariants(ssa, loop_info);
+        let inside_defs = loop_inside_defs(ssa, loop_info);
+        let invariants = find_loop_invariants(ssa, loop_info, &inside_defs);
         if invariants.is_empty() {
             continue;
         }
 
         let phi_back_edge_operands = phi_back_edge_operands(ssa, loop_info);
+        let back_edge_tainted = back_edge_tainted_vars(ssa, loop_info, &phi_back_edge_operands);
         let mut hoistable: Vec<_> = invariants
             .into_iter()
             .filter(|(block_idx, instr_idx)| {
-                can_hoist(
-                    ssa,
-                    loop_info,
-                    &phi_back_edge_operands,
-                    *block_idx,
-                    *instr_idx,
-                )
+                can_hoist(ssa, loop_info, &back_edge_tainted, *block_idx, *instr_idx)
             })
             .collect();
 
@@ -131,24 +132,36 @@ where
             0
         };
 
-        // Convergent filter: drop instructions whose operands are not already
-        // defined outside the loop. Dependent invariants can be hoisted by a
-        // later LICM invocation after their producer has been moved to the
-        // preheader. This avoids inserting a hoisted use before a hoisted def.
-        let mut outside_defs = BitSet::new(ssa.var_id_capacity());
-        for v in ssa.variables() {
-            let site = v.def_site();
-            let preheader_def_after_insert = site.block == preheader_idx
-                && site
-                    .instruction
-                    .is_some_and(|instr_idx| instr_idx >= insert_base);
-            if !loop_info.body.contains(site.block) && !preheader_def_after_insert {
-                outside_defs.insert(v.id().index());
+        // A hoisted instruction's operands must all already be available in the
+        // preheader: defined outside the loop body (i.e. not in `inside_defs`)
+        // and not produced by a preheader instruction at or after the insertion
+        // point. `preheader_after` is that small exclusion set, collected in
+        // O(preheader) — the old code re-derived "outside" with an
+        // all-variables scan per loop.
+        let mut preheader_after = BitSet::new(ssa.var_id_capacity());
+        if let Some(preheader_block) = ssa.block(preheader_idx) {
+            for (instr_idx, instr) in preheader_block.instructions().iter().enumerate() {
+                if instr_idx >= insert_base {
+                    for def in instr.op().defs() {
+                        preheader_after.insert(def.index());
+                    }
+                }
             }
         }
 
         loop {
             let before = hoistable.len();
+            // Defs produced by the instructions still slated for hoisting. An
+            // invariant whose operands are all either defined outside the loop
+            // OR by another hoisted instruction is itself hoistable — the whole
+            // dependency chain moves together in one pass (ordered
+            // topologically below). Recomputed each round because dropping an
+            // instruction can make its dependents unhoistable.
+            let hoistable_defs: HashSet<SsaVarId> = hoistable
+                .iter()
+                .filter_map(|(b, i)| ssa.block(*b).and_then(|blk| blk.instruction(*i)))
+                .flat_map(|instr| instr.op().defs())
+                .collect();
             hoistable.retain(|(block_idx, instr_idx)| {
                 let Some(block) = ssa.block(*block_idx) else {
                     return false;
@@ -170,7 +183,10 @@ where
                 }
                 let mut operands_are_available = true;
                 instr.op().for_each_use(|operand| {
-                    operands_are_available &= outside_defs.contains(operand.index());
+                    let available_outside = !inside_defs.contains(operand.index())
+                        && !preheader_after.contains(operand.index());
+                    operands_are_available &=
+                        available_outside || hoistable_defs.contains(&operand);
                 });
                 operands_are_available
             });
@@ -225,8 +241,12 @@ where
             }
         }
 
-        // Preserve original definition order so dependencies stay valid.
-        to_hoist.sort_by_key(|(block_idx, instr_idx, _)| (*block_idx, *instr_idx));
+        // Order hoisted instructions so every producer precedes its consumers
+        // in the preheader. Original block/instruction position is NOT a valid
+        // order across blocks (a def can sit in a later-indexed block than its
+        // use), which is why hoisting a full dependency chain requires a real
+        // topological sort rather than a positional one.
+        topological_hoist_order(&mut to_hoist);
 
         let mut hoisted_this_loop = 0usize;
         let result = ssa.edit(
@@ -296,9 +316,125 @@ where
     total_hoisted > 0
 }
 
+/// Reorders `items` so every producer precedes its consumers.
+///
+/// All hoisted instructions move into the same preheader, so a use must never
+/// be inserted before its definition. Original block/instruction position is not
+/// a valid order across blocks (a def can live in a higher-indexed block than
+/// its use), so this performs a deterministic topological sort — Kahn's
+/// algorithm with ties broken by original `(block, instruction)` position.
+/// Loop-invariant instructions cannot form a data-dependency cycle; if one
+/// somehow survives, the remainder is appended in positional order as a
+/// defensive fallback rather than dropped.
+fn topological_hoist_order<T: Target>(items: &mut Vec<(usize, usize, SsaOp<T>)>) {
+    let n = items.len();
+    if n < 2 {
+        return;
+    }
+
+    let positions: Vec<(usize, usize)> = items.iter().map(|(b, i, _)| (*b, *i)).collect();
+    let pos_of = |idx: usize| positions.get(idx).copied().unwrap_or_default();
+
+    // Variable -> index of the hoisted instruction that defines it.
+    let mut def_owner: HashMap<SsaVarId, usize> = HashMap::new();
+    for (idx, (_, _, op)) in items.iter().enumerate() {
+        for def in op.defs() {
+            def_owner.insert(def, idx);
+        }
+    }
+
+    let mut indegree: Vec<usize> = vec![0; n];
+    let mut consumers: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (idx, (_, _, op)) in items.iter().enumerate() {
+        let mut producers: HashSet<usize> = HashSet::new();
+        op.for_each_use(|operand| {
+            if let Some(&producer) = def_owner.get(&operand) {
+                if producer != idx {
+                    producers.insert(producer);
+                }
+            }
+        });
+        for producer in producers {
+            if let Some(list) = consumers.get_mut(producer) {
+                list.push(idx);
+            }
+            if let Some(deg) = indegree.get_mut(idx) {
+                *deg = deg.saturating_add(1);
+            }
+        }
+    }
+
+    // Min-heap on original position keeps the order deterministic and close to
+    // the previous positional behaviour for independent instructions.
+    let mut ready: BinaryHeap<Reverse<((usize, usize), usize)>> = (0..n)
+        .filter(|idx| indegree.get(*idx).copied().unwrap_or(0) == 0)
+        .map(|idx| Reverse((pos_of(idx), idx)))
+        .collect();
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    while let Some(Reverse((_, idx))) = ready.pop() {
+        order.push(idx);
+        let Some(consumer_list) = consumers.get(idx) else {
+            continue;
+        };
+        for &consumer in consumer_list {
+            if let Some(deg) = indegree.get_mut(consumer) {
+                *deg = deg.saturating_sub(1);
+                if *deg == 0 {
+                    ready.push(Reverse((pos_of(consumer), consumer)));
+                }
+            }
+        }
+    }
+    if order.len() < n {
+        let mut placed = vec![false; n];
+        for &idx in &order {
+            if let Some(slot) = placed.get_mut(idx) {
+                *slot = true;
+            }
+        }
+        let mut rest: Vec<usize> = (0..n)
+            .filter(|idx| !placed.get(*idx).copied().unwrap_or(false))
+            .collect();
+        rest.sort_by_key(|idx| pos_of(*idx));
+        order.extend(rest);
+    }
+
+    let mut taken: Vec<Option<(usize, usize, SsaOp<T>)>> =
+        std::mem::take(items).into_iter().map(Some).collect();
+    *items = order
+        .into_iter()
+        .filter_map(|idx| taken.get_mut(idx).and_then(Option::take))
+        .collect();
+}
+
+/// Returns the variables whose definition site lies inside the loop body —
+/// instruction results and phi results in body blocks.
+///
+/// This is the complement of the former per-loop "outside defs" set. Scanning
+/// only the loop body makes it O(loop-body); the previous code derived the same
+/// information by scanning every variable in the whole function once per loop
+/// (O(loops × variables)).
+fn loop_inside_defs<T: Target>(ssa: &SsaFunction<T>, loop_info: &LoopInfo) -> BitSet {
+    let mut inside = BitSet::new(ssa.var_id_capacity());
+    for block_idx in loop_info.body.iter() {
+        if let Some(block) = ssa.block(block_idx) {
+            for phi in block.phi_nodes() {
+                inside.insert(phi.result().index());
+            }
+            for instr in block.instructions() {
+                for def in instr.op().defs() {
+                    inside.insert(def.index());
+                }
+            }
+        }
+    }
+    inside
+}
+
 fn find_loop_invariants<T: Target>(
     ssa: &SsaFunction<T>,
     loop_info: &LoopInfo,
+    inside_defs: &BitSet,
 ) -> Vec<(usize, usize)> {
     let mut invariants: HashSet<(usize, usize)> = HashSet::new();
     let mut invariant_defs = BitSet::new(ssa.var_id_capacity());
@@ -307,14 +443,6 @@ fn find_loop_invariants<T: Target>(
     if let Some(header_block) = ssa.block(loop_info.header.index()) {
         for phi in header_block.phi_nodes() {
             header_phi_defs.insert(phi.result().index());
-        }
-    }
-
-    let mut outside_defs = BitSet::new(ssa.var_id_capacity());
-    for var in ssa.variables() {
-        let def_site = var.def_site();
-        if !loop_info.body.contains(def_site.block) {
-            outside_defs.insert(var.id().index());
         }
     }
 
@@ -351,7 +479,7 @@ fn find_loop_invariants<T: Target>(
         else {
             continue;
         };
-        if is_instruction_invariant(instr, &outside_defs, &invariant_defs, &header_phi_defs) {
+        if is_instruction_invariant(instr, inside_defs, &invariant_defs, &header_phi_defs) {
             invariants.insert((block_idx, instr_idx));
             for def in instr.defs() {
                 invariant_defs.insert(def.index());
@@ -371,7 +499,7 @@ fn find_loop_invariants<T: Target>(
 
 fn is_instruction_invariant<T: Target>(
     instr: &SsaInstruction<T>,
-    outside_defs: &BitSet,
+    inside_defs: &BitSet,
     invariant_defs: &BitSet,
     header_phi_defs: &BitSet,
 ) -> bool {
@@ -380,7 +508,11 @@ fn is_instruction_invariant<T: Target>(
         if header_phi_defs.contains(operand.index()) {
             invariant = false;
         }
-        if !outside_defs.contains(operand.index()) && !invariant_defs.contains(operand.index()) {
+        // An operand defined inside the loop and not yet proven invariant breaks
+        // invariance. `inside_defs` is the complement of the former `outside_defs`
+        // set, computed once by the caller in O(loop-body) instead of a per-loop
+        // O(all-variables) scan.
+        if inside_defs.contains(operand.index()) && !invariant_defs.contains(operand.index()) {
             invariant = false;
         }
     });
@@ -390,7 +522,7 @@ fn is_instruction_invariant<T: Target>(
 fn can_hoist<T: Target>(
     ssa: &SsaFunction<T>,
     loop_info: &LoopInfo,
-    phi_back_edge_operands: &BitSet,
+    back_edge_tainted: &BitSet,
     block_idx: usize,
     instr_idx: usize,
 ) -> bool {
@@ -409,12 +541,62 @@ fn can_hoist<T: Target>(
     if loop_info.preheader.is_none() {
         return false;
     }
+    // Reject instructions whose result transitively feeds a phi operand on a
+    // loop back-edge (hoisting would erase per-edge value distinctions). The
+    // taint set is precomputed once per loop, so this is an O(1) membership
+    // test rather than a per-candidate def-use traversal.
     for dest in instr.defs() {
-        if feeds_phi_back_edge(ssa, loop_info, phi_back_edge_operands, dest) {
+        if back_edge_tainted.contains(dest.index()) {
             return false;
         }
     }
     true
+}
+
+/// Computes, in one backward pass, the set of in-loop values that transitively
+/// feed a phi operand on a loop back-edge.
+///
+/// [`can_hoist`] must reject any instruction whose result feeds such a phi.
+/// Answering that per candidate with an independent forward def-use walk is
+/// `O(candidates × loop)`; seeding a worklist from the back-edge phi operands
+/// and propagating backward through in-loop defining instructions answers it
+/// for *every* value in `O(loop)` once. A value is tainted when it is itself a
+/// back-edge operand, or when it is an operand of an in-loop instruction whose
+/// result is tainted.
+fn back_edge_tainted_vars<T: Target>(
+    ssa: &SsaFunction<T>,
+    loop_info: &LoopInfo,
+    phi_back_edge_operands: &BitSet,
+) -> BitSet {
+    let mut tainted = phi_back_edge_operands.clone();
+    let mut worklist: VecDeque<SsaVarId> = phi_back_edge_operands
+        .iter()
+        .map(SsaVarId::from_index)
+        .collect();
+    while let Some(value) = worklist.pop_front() {
+        let Some(var) = ssa.variable(value) else {
+            continue;
+        };
+        let site = var.def_site();
+        if !loop_info.body.contains(site.block) {
+            continue;
+        }
+        let Some(instr_idx) = site.instruction else {
+            continue;
+        };
+        let Some(instr) = ssa
+            .block(site.block)
+            .and_then(|block| block.instruction(instr_idx))
+        else {
+            continue;
+        };
+        instr.op().for_each_use(|operand| {
+            if tainted.insert(operand.index()) {
+                worklist.push_back(operand);
+            }
+        });
+    }
+    tainted
 }
 
 fn phi_back_edge_operands<T: Target>(ssa: &SsaFunction<T>, loop_info: &LoopInfo) -> BitSet {
@@ -432,45 +614,6 @@ fn phi_back_edge_operands<T: Target>(ssa: &SsaFunction<T>, loop_info: &LoopInfo)
         }
     }
     operands
-}
-
-fn feeds_phi_back_edge<T: Target>(
-    ssa: &SsaFunction<T>,
-    loop_info: &LoopInfo,
-    phi_back_edge_operands: &BitSet,
-    var: SsaVarId,
-) -> bool {
-    let mut worklist: VecDeque<SsaVarId> = VecDeque::new();
-    let mut visited = BitSet::new(ssa.var_id_capacity());
-    worklist.push_back(var);
-    visited.insert(var.index());
-
-    while let Some(current) = worklist.pop_front() {
-        if phi_back_edge_operands.contains(current.index()) {
-            return true;
-        }
-
-        let Some(current_var) = ssa.variable(current) else {
-            continue;
-        };
-        for site in current_var.uses() {
-            if site.is_phi_operand || !loop_info.body.contains(site.block) {
-                continue;
-            }
-            let Some(instr) = ssa
-                .block(site.block)
-                .and_then(|block| block.instruction(site.instruction))
-            else {
-                continue;
-            };
-            for dest in instr.defs() {
-                if visited.insert(dest.index()) {
-                    worklist.push_back(dest);
-                }
-            }
-        }
-    }
-    false
 }
 
 #[cfg(test)]

@@ -34,8 +34,10 @@
 use std::collections::HashMap;
 
 use crate::{
+    analysis::cfg::SsaCfg,
     bitset::BitSet,
     events::{EventKind, EventListener},
+    graph::{algorithms::compute_dominators, RootedGraph},
     ir::{
         function::{SsaEditOptions, SsaFunction, SsaRollbackPolicy},
         ops::{BinaryOpKind, SsaOp, UnaryOpKind},
@@ -164,8 +166,25 @@ where
             .with_verify(cfg!(debug_assertions))
             .with_rollback(rollback),
         |editor| {
+            // Build the dominator tree once for the whole batch. Replacing uses
+            // never rewrites a terminator, so one tree stays valid across every
+            // forward below; the per-site check consults it only for cross-block
+            // uses (same-block uses fall back to instruction ordering), so a
+            // single global tree is behaviour-equivalent to the previous
+            // per-pair `replace_uses_checked`, which rebuilt the CFG + dominator
+            // tree (and rescanned every block) once per redundant pair.
+            let dominators = if editor.function().block_count() > 0 {
+                let cfg = SsaCfg::from_ssa(editor.function());
+                Some(compute_dominators(&cfg, cfg.entry()))
+            } else {
+                None
+            };
             for (redundant_var, original_var, _block_idx, _instr_idx) in &redundant {
-                let result = editor.replace_uses_checked(*redundant_var, *original_var);
+                let result = editor.replace_uses_checked_with(
+                    *redundant_var,
+                    *original_var,
+                    dominators.as_ref(),
+                );
                 if result.replaced > 0 {
                     let event = crate::events::Event {
                         kind: EventKind::ConstantFolded,

@@ -45,7 +45,7 @@ use crate::{
         function::{SsaEditOptions, SsaEditor, SsaFunction},
         ops::SsaOp,
     },
-    passes::utils::resolve_chain,
+    passes::utils::{loop_canonical_blocks, resolve_chain},
     target::Target,
 };
 
@@ -112,7 +112,11 @@ where
     T: Target,
     L: EventListener<T> + ?Sized,
 {
-    let trampolines = ssa.find_trampoline_blocks(true);
+    let mut trampolines = ssa.find_trampoline_blocks(true);
+    // Preserve canonical loop preheaders so this pass does not fight the loop
+    // canonicalizer (which re-inserts any preheader merged away here).
+    let preheaders = loop_canonical_blocks(ssa);
+    trampolines.retain(|block, _| !preheaders.contains(block));
     if trampolines.is_empty() {
         return 0;
     }

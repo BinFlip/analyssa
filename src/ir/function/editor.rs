@@ -424,6 +424,34 @@ impl<'a, T: Target> SsaEditor<'a, T> {
         result
     }
 
+    /// Replaces instruction uses of `old_var` with `new_var` against a
+    /// caller-supplied dominator tree, skipping the per-call CFG + dominator
+    /// construction that [`replace_uses_checked`](Self::replace_uses_checked)
+    /// performs internally.
+    ///
+    /// Replacing instruction uses never rewrites a terminator, so a single
+    /// dominator tree stays valid across an entire batch of replacements. A
+    /// pass that rewrites many variables (e.g. GVN) should build the tree once
+    /// from [`function`](Self::function) and reuse it here, turning a per-pair
+    /// O(blocks) dominator rebuild into one build for the whole batch.
+    ///
+    /// The edit scope is widened to [`SsaEditScope::UsesOnly`] when at least one
+    /// operand occurrence is replaced.
+    pub fn replace_uses_checked_with(
+        &mut self,
+        old_var: SsaVarId,
+        new_var: SsaVarId,
+        dominators: Option<&DominatorTree>,
+    ) -> CheckedReplaceResult {
+        let result = self
+            .ssa
+            .replace_uses_checked_with(old_var, new_var, dominators);
+        if result.replaced > 0 {
+            self.mark_changed(SsaEditScope::UsesOnly);
+        }
+        result
+    }
+
     /// Propagates copy mappings through instruction operands.
     ///
     /// The edit scope is widened to [`SsaEditScope::UsesOnly`] when at least

@@ -8,7 +8,9 @@
 //!   the ultimate target (used by trampoline resolution, copy propagation,
 //!   and control flow simplification).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+use crate::{analysis::loop_analyzer::SsaLoopAnalysis, ir::function::SsaFunction, target::Target};
 
 /// Test whether an integer is a positive power of two.
 ///
@@ -78,6 +80,34 @@ where
     }
 
     current
+}
+
+/// Returns the block indices that hold canonical loop structure — preheaders
+/// and latches — which CFG-simplification passes must preserve.
+///
+/// The loop canonicalizer inserts a single non-loop predecessor (preheader) in
+/// front of each loop header and a single unified back-edge block (latch) when a
+/// loop has several. Both are forwarding blocks: an empty preheader or unified
+/// latch is just a jump, which the control-flow and block-merge passes would
+/// otherwise eliminate as a trampoline. Doing so re-exposes the loop's multiple
+/// non-loop predecessors / multiple latches, and the canonicalizer re-inserts
+/// the block on the next iteration — an infinite oscillation that never reaches
+/// a fixpoint. Skipping these blocks keeps the IR in canonical loop-simplify
+/// form (the same trade-off LLVM's `simplifycfg` makes under loop-simplify
+/// form). Non-trampoline preheaders/latches are unaffected — they are never in
+/// the trampoline set to begin with.
+#[must_use]
+pub fn loop_canonical_blocks<T: Target>(ssa: &SsaFunction<T>) -> HashSet<usize> {
+    let mut blocks = HashSet::new();
+    for loop_info in ssa.analyze_loops().iter() {
+        if let Some(preheader) = loop_info.preheader {
+            blocks.insert(preheader.index());
+        }
+        for latch in &loop_info.latches {
+            blocks.insert(latch.index());
+        }
+    }
+    blocks
 }
 
 #[cfg(test)]
