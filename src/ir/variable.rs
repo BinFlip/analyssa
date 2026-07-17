@@ -125,6 +125,15 @@ impl SsaVarId {
         // Undo the complement encoding applied in `from_index`.
         (!self.0.get()) as usize
     }
+
+    /// Returns the underlying index as a `u32`.
+    ///
+    /// Identical to [`Self::index`] but in the `u32` domain the complement
+    /// encoding guarantees, for hosts that persist compact value ids.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        !self.0.get()
+    }
 }
 
 impl Default for SsaVarId {
@@ -144,6 +153,28 @@ impl Ord for SsaVarId {
         // Order by logical index, not by the complement-encoded storage (which
         // would reverse the ordering).
         self.index().cmp(&other.index())
+    }
+}
+
+/// Serializes as the logical index, not the internal representation.
+///
+/// `SsaVarId` stores the bitwise complement of its index to give the type an
+/// `Option` niche. That encoding is an internal layout optimization, so the wire
+/// format is the index itself — deriving would publish the complement and pin it
+/// as the on-disk format forever.
+#[cfg(feature = "serde")]
+impl serde::Serialize for SsaVarId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u32(self.as_u32())
+    }
+}
+
+/// Deserializes from the logical index; see [`SsaVarId`]'s `Serialize` impl.
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for SsaVarId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let index = <u32 as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(Self::from_index(index as usize))
     }
 }
 
@@ -183,6 +214,7 @@ impl fmt::Display for SsaVarId {
 /// let phi_origin = VariableOrigin::Phi;          // From phi node
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum VariableOrigin {
     /// Method argument (parameter).
     ///
@@ -270,6 +302,7 @@ impl fmt::Display for VariableOrigin {
 /// assert_eq!(alloc.count(), 2);
 /// ```
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FunctionVarAllocator {
     next_id: usize,
 }
@@ -316,6 +349,7 @@ impl Default for FunctionVarAllocator {
 /// this is a specific instruction within a block. For phi nodes, the definition
 /// is at the block entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DefSite {
     /// The block where this variable is defined.
     pub block: usize,
@@ -367,6 +401,7 @@ impl DefSite {
 ///
 /// Records where in the program a variable is used (read).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct UseSite {
     /// The block where this variable is used.
     pub block: usize,
@@ -419,6 +454,14 @@ impl UseSite {
 /// Variables are created through [`SsaFunction::create_variable()`](crate::ir::function::SsaFunction::create_variable),
 /// which ensures dense ID allocation, origin registration, and type tracking.
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(bound(
+        serialize = "T::Type: serde::Serialize",
+        deserialize = "T::Type: serde::Deserialize<'de>"
+    ))
+)]
 pub struct SsaVariable<T: Target> {
     /// Dense unique identifier within the owning function.
     /// Invariant: `id.index() == position in SsaFunction.variables`.

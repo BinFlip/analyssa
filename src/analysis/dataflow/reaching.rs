@@ -52,19 +52,38 @@ use crate::{
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use analyssa::analysis::dataflow::{DataFlowSolver, ReachingDefinitions};
+/// ```rust
+/// use analyssa::{
+///     analysis::{
+///         dataflow::{DataFlowSolver, ReachingDefinitions},
+///         SsaCfg,
+///     },
+///     ir::SsaVarId,
+///     testing,
+/// };
+///
+/// // Diamond CFG: block 0 branches to blocks 1 and 2, which both jump to 3.
+/// let ssa = testing::diamond_phi_fixture();
+/// let graph = SsaCfg::from_ssa(&ssa);
 ///
 /// let analysis = ReachingDefinitions::new(&ssa);
-/// let mut solver = DataFlowSolver::new(analysis);
+/// let solver = DataFlowSolver::new(analysis);
 /// let results = solver.solve(&ssa, &graph);
 ///
-/// // Check which definitions reach a block
-/// if let Some(reaching) = results.in_state(block_id) {
-///     for var_id in reaching.definitions() {
-///         println!("Definition {} reaches block {}", var_id, block_id);
-///     }
-/// }
+/// // Both arms of the diamond reach the merge block.
+/// let condition = SsaVarId::from_index(0);
+/// let left = SsaVarId::from_index(1);
+/// let right = SsaVarId::from_index(2);
+/// let reaching: Vec<_> = results.in_state(3).unwrap().definitions().collect();
+/// assert!(reaching.contains(&left));
+/// assert!(reaching.contains(&right));
+///
+/// // A definition does not reach the block that creates it, but does reach
+/// // its successors: the condition is defined in block 0, so it reaches
+/// // block 1 but is absent from block 0's entry state.
+/// let entry: Vec<_> = results.in_state(0).unwrap().definitions().collect();
+/// assert!(!entry.contains(&condition));
+/// assert!(results.in_state(1).unwrap().definitions().any(|v| v == condition));
 /// ```
 pub struct ReachingDefinitions {
     /// Number of variables in the function.

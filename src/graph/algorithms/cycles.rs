@@ -50,7 +50,7 @@ use crate::graph::{NodeId, Successors};
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId, algorithms::has_cycle};
 ///
 /// // Acyclic graph: A -> B -> C
@@ -177,7 +177,7 @@ fn has_cycle_dfs<G: Successors>(
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId, algorithms::find_cycle};
 ///
 /// // Cyclic graph: A -> B -> C -> A

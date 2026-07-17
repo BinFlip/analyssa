@@ -57,19 +57,31 @@ use crate::{
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use analyssa::analysis::dataflow::{DataFlowSolver, LiveVariables};
+/// ```rust
+/// use analyssa::{
+///     analysis::{
+///         dataflow::{DataFlowSolver, LiveVariables},
+///         SsaCfg,
+///     },
+///     ir::SsaVarId,
+///     testing,
+/// };
+///
+/// // Block 1 defines the loop counter phi; block 2 returns it.
+/// let ssa = testing::loop_counter_fixture();
+/// let graph = SsaCfg::from_ssa(&ssa);
 ///
 /// let analysis = LiveVariables::new(&ssa);
-/// let mut solver = DataFlowSolver::new(analysis);
+/// let solver = DataFlowSolver::new(analysis);
 /// let results = solver.solve(&ssa, &graph);
 ///
-/// // Check which variables are live at block exit
-/// if let Some(live) = results.out_state(block_id) {
-///     for var_id in live.variables() {
-///         println!("Variable {} is live at exit of block {}", var_id, block_id);
-///     }
-/// }
+/// // The counter is live on entry to block 2, because block 2 returns it.
+/// let counter = SsaVarId::from_index(1);
+/// let live_in = results.in_state(2).unwrap();
+/// assert!(live_in.variables().any(|var| var == counter));
+///
+/// // Nothing is live after the return terminator.
+/// assert_eq!(results.out_state(2).unwrap().variables().count(), 0);
 /// ```
 pub struct LiveVariables {
     /// Number of variables in the function.

@@ -39,7 +39,7 @@ use crate::graph::NodeId;
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, GraphBase};
 ///
 /// let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -77,7 +77,7 @@ pub trait GraphBase {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId, Successors};
 ///
 /// let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -125,7 +125,7 @@ pub trait Successors: GraphBase {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId, Predecessors};
 ///
 /// let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -179,12 +179,12 @@ pub trait Predecessors: GraphBase {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId, RootedGraph, Successors, Predecessors};
 ///
 /// // Create a control flow graph with explicit entry
 /// struct ControlFlowGraph {
-///     graph: DirectedGraph<&'static str, ()>,
+///     graph: DirectedGraph<'static, &'static str, ()>,
 ///     entry: NodeId,
 /// }
 ///
@@ -208,6 +208,16 @@ pub trait Predecessors: GraphBase {
 /// impl RootedGraph for ControlFlowGraph {
 ///     fn entry(&self) -> NodeId { self.entry }
 /// }
+///
+/// let mut graph: DirectedGraph<&'static str, ()> = DirectedGraph::new();
+/// let entry = graph.add_node("entry");
+/// let body = graph.add_node("body");
+/// graph.add_edge(entry, body, ()).unwrap();
+///
+/// let cfg = ControlFlowGraph { graph, entry };
+/// assert_eq!(cfg.entry(), entry);
+/// assert_eq!(cfg.successors(cfg.entry()).collect::<Vec<_>>(), vec![body]);
+/// assert_eq!(cfg.predecessors(body).collect::<Vec<_>>(), vec![entry]);
 /// ```
 pub trait RootedGraph: Successors + Predecessors {
     /// Returns the entry (root) node of the graph.

@@ -38,6 +38,7 @@
 /// assert_eq!(PointerSize::Bit32.mask_signed(0xFFFFFFFF), -1_i64);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PointerSize {
     /// 8-bit target architecture with 1-byte pointers.
     Bit8,

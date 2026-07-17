@@ -37,6 +37,7 @@ use std::fmt;
 /// via [`SsaFunction::new`](super::SsaFunction::new) or
 /// [`SsaFunction::with_capacity`](super::SsaFunction::with_capacity).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum FunctionKind {
     /// A regular function with standard call/return semantics.
     ///

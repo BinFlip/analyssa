@@ -57,6 +57,18 @@ use crate::{
 /// );
 /// ```
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(bound(
+        serialize = "T::Type: serde::Serialize, T::TypeRef: serde::Serialize, \
+                     T::MethodRef: serde::Serialize, T::FieldRef: serde::Serialize, \
+                     T::SigRef: serde::Serialize, T::OriginalInstruction: serde::Serialize",
+        deserialize = "T::Type: serde::Deserialize<'de>, T::TypeRef: serde::Deserialize<'de>, \
+                       T::MethodRef: serde::Deserialize<'de>, T::FieldRef: serde::Deserialize<'de>, \
+                       T::SigRef: serde::Deserialize<'de>, T::OriginalInstruction: serde::Deserialize<'de>"
+    ))
+)]
 pub struct SsaInstruction<T: Target> {
     /// The original host instruction retained for debugging, source mapping,
     /// and code generation. Hosts can store a decoded instruction, source
@@ -135,6 +147,32 @@ impl<T: Target> SsaInstruction<T> {
     pub fn set_op(&mut self, op: SsaOp<T>) {
         self.op = op;
         self.result_type = None;
+    }
+
+    /// Sets the decomposed SSA operation while preserving the resolved result
+    /// type.
+    ///
+    /// Unlike [`Self::set_op`] (which clears `result_type`), this re-stamps the
+    /// type from the new op's structural inference
+    /// ([`SsaOp::infer_result_type`]) when one is available, falling back to the
+    /// prior type otherwise. Rewriting passes that replace an op without
+    /// changing the value its destination produces — variable remapping,
+    /// constant folding, in-place op replacement — use this so resolved types,
+    /// **especially the non-structural ones the rebuild cannot recover** (call
+    /// return types, field types), do not silently vanish.
+    ///
+    /// An op with no destination ([`SsaOp::Nop`], stores, terminators) produces
+    /// no value, so there is nothing to preserve and `result_type` is cleared.
+    /// This keeps the removal path (`SsaEditor::nop_instruction`) from leaving a
+    /// dead type stamped on an instruction that no longer defines anything.
+    pub fn set_op_preserving_type(&mut self, op: SsaOp<T>) {
+        let prev = self.result_type.take();
+        self.op = op;
+        self.result_type = if self.op.dest().is_some() {
+            self.op.infer_result_type().or(prev)
+        } else {
+            None
+        };
     }
 
     /// Returns the resolved result type, if set during SSA construction.
@@ -338,6 +376,59 @@ mod tests {
         assert_eq!(instr.result_type(), Some(&MockType::Unknown));
         instr.set_result_type(None);
         assert_eq!(instr.result_type(), None);
+    }
+
+    #[test]
+    fn set_op_preserving_type_keeps_non_inferrable_type() {
+        // `LoadArg`'s type is not structurally inferrable (the same class as
+        // call returns and field loads). A rewriting pass that replaces the op
+        // via `set_op_preserving_type` must carry the resolved type forward;
+        // clearing it (as `set_op` does) would make the type silently vanish
+        // before the next rebuild.
+        let mut instr = SsaInstruction::<MockTarget>::synthetic(SsaOp::LoadArg {
+            dest: var(0),
+            arg_index: 0,
+        })
+        .with_result_type(MockType::I32);
+        assert_eq!(instr.result_type(), Some(&MockType::I32));
+
+        instr.set_op_preserving_type(SsaOp::LoadArg {
+            dest: var(0),
+            arg_index: 1,
+        });
+        assert_eq!(
+            instr.result_type(),
+            Some(&MockType::I32),
+            "a non-inferrable replacement carries the prior type forward",
+        );
+
+        // The clearing primitive still clears.
+        instr.set_op(SsaOp::LoadArg {
+            dest: var(0),
+            arg_index: 2,
+        });
+        assert_eq!(instr.result_type(), None);
+    }
+
+    #[test]
+    fn set_op_preserving_type_clears_type_for_destless_op() {
+        // `SsaOp::Nop` defines nothing, so there is no value whose type could be
+        // preserved. This is the removal primitive DCE and GVN drive through
+        // `SsaEditor::nop_instruction`; carrying `I32` onto a `Nop` leaves a
+        // dead type stamped on an instruction with no destination.
+        let mut instr = SsaInstruction::<MockTarget>::synthetic(SsaOp::LoadArg {
+            dest: var(0),
+            arg_index: 0,
+        })
+        .with_result_type(MockType::I32);
+
+        instr.set_op_preserving_type(SsaOp::Nop);
+
+        assert_eq!(
+            instr.result_type(),
+            None,
+            "an op with no destination must not retain the replaced value's type",
+        );
     }
 
     #[test]

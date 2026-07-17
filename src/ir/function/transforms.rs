@@ -161,20 +161,32 @@ impl<T: Target> SsaFunction<T> {
     ///
     /// # Usage
     ///
-    /// This is a crate-internal method (used by the copy-propagation pass), so
-    /// the example is illustrative rather than executable from outside the
-    /// crate:
+    /// This is a crate-internal method used by the copy-propagation pass. It is
+    /// reachable from outside the crate through the checked edit session on
+    /// [`SsaEditor::propagate_copies`](crate::ir::function::SsaEditor::propagate_copies):
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use std::collections::BTreeMap;
-    /// use analyssa::{ir::SsaVarId, testing};
+    /// use analyssa::{
+    ///     ir::{function::SsaEditOptions, SsaVarId},
+    ///     testing,
+    /// };
     ///
-    /// let mut ssa = testing::const_i32_return(42);
-    /// let dest = SsaVarId::from_index(0);
-    /// let src = dest;
-    /// let resolved_copies = BTreeMap::from([(dest, src)]);
-    /// let result = ssa.propagate_copies(&resolved_copies);
-    /// assert_eq!(result.total_replaced, 0);
+    /// // The fixture ends block 0 with `v9 = copy v8`, and block 1 returns v9.
+    /// let mut ssa = testing::scalar_rewrite_fixture();
+    /// let dest = SsaVarId::from_index(9);
+    /// let src = SsaVarId::from_index(8);
+    ///
+    /// let copies = BTreeMap::from([(dest, src)]);
+    /// ssa.edit(SsaEditOptions::new(), |editor| {
+    ///     let result = editor.propagate_copies(&copies);
+    ///
+    ///     // The single use of `dest` (the return in block 1) now reads `src`.
+    ///     assert_eq!(result.total_replaced, 1);
+    ///     assert!(result.fully_propagated.contains(dest.index()));
+    ///     Ok(())
+    /// })
+    /// .unwrap();
     /// ```
     pub(in crate::ir::function) fn propagate_copies(
         &mut self,
@@ -387,7 +399,7 @@ impl<T: Target> SsaFunction<T> {
     ) -> bool {
         if let Some(block) = self.blocks.get_mut(block_idx) {
             if let Some(instr) = block.instructions_mut().get_mut(instr_idx) {
-                instr.set_op(new_op);
+                instr.set_op_preserving_type(new_op);
                 return true;
             }
         }
@@ -699,7 +711,7 @@ impl<T: Target> SsaFunction<T> {
         if let Some(block) = self.blocks.get_mut(block_idx) {
             if let Some(instr) = block.instructions_mut().get_mut(instr_idx) {
                 if let Some(dest) = instr.op().dest() {
-                    instr.set_op(SsaOp::Const { dest, value });
+                    instr.set_op_preserving_type(SsaOp::Const { dest, value });
                     return true;
                 }
             }

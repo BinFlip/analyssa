@@ -50,11 +50,16 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use analyssa::analysis::taint::{PhiTaintMode, TaintAnalysis, TaintConfig};
-//! use analyssa::{ir::SsaFunction, MockTarget};
+//! ```rust
+//! use analyssa::{
+//!     analysis::taint::{PhiTaintMode, TaintAnalysis, TaintConfig},
+//!     ir::SsaVarId,
+//!     testing,
+//! };
 //!
-//! let ssa: SsaFunction<MockTarget> = /* ... */;
+//! // Block 0 computes a chain of arithmetic rooted at `v0`, plus an
+//! // independent unused constant `v10`.
+//! let ssa = testing::scalar_rewrite_fixture();
 //!
 //! let config = TaintConfig {
 //!     forward: true,
@@ -64,13 +69,15 @@
 //! };
 //!
 //! let mut taint = TaintAnalysis::new(config);
-//! taint.add_tainted_var(some_var_id);
+//! taint.add_tainted_var(SsaVarId::from_index(0));
 //! taint.propagate(&ssa);
 //!
-//! // Check what's tainted
-//! if taint.is_var_tainted(other_var_id) {
-//!     println!("Variable is tainted!");
-//! }
+//! // Check what's tainted: the seed and everything derived from it.
+//! assert!(taint.is_var_tainted(SsaVarId::from_index(0)));
+//! assert!(taint.is_var_tainted(SsaVarId::from_index(8)));
+//!
+//! // Values that never flow into the tainted chain stay clean.
+//! assert!(!taint.is_var_tainted(SsaVarId::from_index(10)));
 //! ```
 
 use std::collections::HashSet;

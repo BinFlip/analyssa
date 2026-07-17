@@ -26,6 +26,7 @@ use crate::{ir::value::ConstValue, PointerSize};
 
 /// Element category for a target-independent vector lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum VectorLaneKind {
     /// Integer lane with an explicit bit width.
     Integer,
@@ -37,6 +38,7 @@ pub enum VectorLaneKind {
 
 /// Describes the lane layout of a target-independent vector value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorShape {
     /// Number of lanes in the vector.
     pub lane_count: u32,
@@ -83,6 +85,7 @@ impl VectorShape {
 
 /// Describes the representation used for vector masks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorMaskShape {
     /// Number of predicate lanes in the mask.
     pub lane_count: u32,
@@ -112,6 +115,7 @@ impl VectorMaskShape {
 
 /// Scales a vector shape relative to the target's runtime vector length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorLengthMultiplier {
     /// Numerator of the vector-length multiplier.
     pub numerator: u32,
@@ -150,6 +154,7 @@ impl VectorLengthMultiplier {
 
 /// Tail-lane behavior for scalable vector operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum VectorTailPolicy {
     /// Inactive tail lanes may take any value.
     Agnostic,
@@ -159,6 +164,7 @@ pub enum VectorTailPolicy {
 
 /// Inactive-mask-lane behavior for scalable vector operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum VectorMaskPolicy {
     /// Inactive mask lanes may take any value.
     Agnostic,
@@ -168,6 +174,7 @@ pub enum VectorMaskPolicy {
 
 /// Describes a scalable vector value whose concrete lane count is runtime-dependent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ScalableVectorShape {
     /// Minimum number of lanes guaranteed by the target type.
     pub min_lane_count: u32,
@@ -216,6 +223,7 @@ impl ScalableVectorShape {
 
 /// Describes a scalable predicate or mask value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ScalableVectorMaskShape {
     /// Minimum number of predicate lanes guaranteed by the target type.
     pub min_lane_count: u32,
@@ -252,6 +260,7 @@ impl ScalableVectorMaskShape {
 
 /// Unified descriptor for fixed-width and scalable vector values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum VectorDescriptor {
     /// Fixed-width vector with a statically known lane count and total width.
     Fixed(VectorShape),
@@ -324,6 +333,7 @@ impl VectorDescriptor {
 
 /// Unified descriptor for fixed-width and scalable vector masks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum VectorMaskDescriptor {
     /// Fixed-width mask with a statically known lane count.
     Fixed(VectorMaskShape),
@@ -362,6 +372,7 @@ impl VectorMaskDescriptor {
 
 /// One lane selector in a vector shuffle mask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum VectorShuffleLane {
     /// Produces an undefined lane.
     Undef,
@@ -375,6 +386,7 @@ pub enum VectorShuffleLane {
 
 /// Describes lane selection for one- or two-input vector shuffles.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VectorShuffleMask {
     lanes: Vec<VectorShuffleLane>,
 }
@@ -424,6 +436,7 @@ impl VectorShuffleMask {
 /// assert_eq!(Endianness::Big, Endianness::Big);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Endianness {
     /// Least significant byte stored first (x86, RISC-V, Nios II, default).
     Little,

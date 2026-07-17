@@ -55,25 +55,63 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use analyssa::{analysis::PatternDetector, ir::SsaFunction, MockTarget, PointerSize};
+//! ```rust
+//! use analyssa::{
+//!     analysis::PatternDetector,
+//!     ir::function::{SsaDefSpec, SsaFunctionBuilder},
+//!     testing::{MockTarget, MockType},
+//!     PointerSize,
+//! };
 //!
-//! let ssa: SsaFunction<MockTarget> = /* ... */;
+//! // Build a minimal flattened function: block 1 switches on a state phi to
+//! // block 2 or 3, and block 2 loops back to the dispatcher.
+//! let spec = || SsaDefSpec::local(0, MockType::I32);
+//! let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 6);
+//! builder.ensure_block(3);
+//!
+//! let zero = builder
+//!     .in_block(0, |block| {
+//!         let zero = block.const_i32(spec(), 0)?;
+//!         block.jump(1)?;
+//!         Ok(zero)
+//!     })
+//!     .unwrap();
+//! let state = builder
+//!     .in_block(1, |block| {
+//!         let state = block.empty_phi(spec())?;
+//!         block.switch(state, vec![2, 3], 3)?;
+//!         Ok(state)
+//!     })
+//!     .unwrap();
+//! let next = builder
+//!     .in_block(2, |block| {
+//!         let next = block.const_i32(spec(), 1)?;
+//!         block.jump(1)?;
+//!         Ok(next)
+//!     })
+//!     .unwrap();
+//! builder.in_block(3, |block| block.ret(None)).unwrap();
+//! builder.add_phi_operand(1, state, 0, zero).unwrap();
+//! builder.add_phi_operand(1, state, 2, next).unwrap();
+//! let ssa = builder.finish().unwrap();
 //!
 //! let detector = PatternDetector::new(&ssa, PointerSize::Bit32);
 //!
 //! // Find dispatcher patterns
 //! let dispatchers = detector.find_dispatchers();
+//! assert_eq!(dispatchers.len(), 1);
 //!
-//! for dispatcher in &dispatchers {
-//!     println!("Dispatcher at block {}", dispatcher.block);
+//! let dispatcher = &dispatchers[0];
+//! assert_eq!(dispatcher.block, 1);
+//! assert_eq!(dispatcher.switch_var, state);
+//! assert_eq!(dispatcher.case_count(), 2);
+//! assert_eq!(dispatcher.target_for_case(0), 2);
 //!
-//!     // Find all source blocks
-//!     let sources = detector.find_sources(dispatcher);
-//!     for source in &sources {
-//!         println!("  Source block {} -> case {}", source.block, source.target_case);
-//!     }
-//! }
+//! // Find all source blocks: the entry seeds the state, and the case block
+//! // loops back with an updated state.
+//! let sources = detector.find_sources(dispatcher);
+//! let blocks: Vec<_> = sources.iter().map(|source| source.block).collect();
+//! assert_eq!(blocks, vec![0, 2]);
 //! ```
 
 use std::collections::HashMap;

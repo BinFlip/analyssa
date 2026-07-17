@@ -43,21 +43,44 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use analyssa::analysis::{ConstEvaluator, PhiAnalyzer};
+//! ```rust
+//! use analyssa::{
+//!     analysis::{ConstEvaluator, PhiAnalyzer},
+//!     ir::{value::ConstValue, SsaVarId},
+//!     testing, PointerSize,
+//! };
+//!
+//! // Diamond CFG whose merge block holds `v3 = phi([1] v1, [2] v2)`,
+//! // where block 1 defines `v1 = 10` and block 2 defines `v2 = 20`.
+//! let mut ssa = testing::diamond_phi_fixture();
+//! let left = SsaVarId::from_index(1);
+//!
+//! {
+//!     let analyzer = PhiAnalyzer::new(&ssa);
+//!     let phi = &ssa.block(3).unwrap().phi_nodes()[0];
+//!
+//!     // Two distinct sources: neither trivial nor a uniform constant.
+//!     assert!(analyzer.is_trivial(phi).is_none());
+//!
+//!     let mut evaluator = ConstEvaluator::new(&ssa, PointerSize::Bit64);
+//!     assert!(analyzer.uniform_constant(phi, &mut evaluator).is_none());
+//! }
+//!
+//! // Point the block-2 operand at the same source as the block-1 operand.
+//! ssa.block_mut(3).unwrap().phi_nodes_mut()[0].set_operand(2, left);
 //!
 //! let analyzer = PhiAnalyzer::new(&ssa);
+//! let phi = &ssa.block(3).unwrap().phi_nodes()[0];
 //!
-//! // Check if a PHI is trivial (has single unique non-self source)
-//! if let Some(source) = analyzer.is_trivial(phi) {
-//!     println!("PHI can be replaced with copy from {:?}", source);
-//! }
+//! // Now the PHI is trivial and can be replaced with a copy from `left`.
+//! assert_eq!(analyzer.is_trivial(phi), Some(left));
 //!
-//! // Check if all PHI operands resolve to the same constant
+//! // ...and every operand resolves to the same constant.
 //! let mut evaluator = ConstEvaluator::new(&ssa, PointerSize::Bit64);
-//! if let Some(value) = analyzer.uniform_constant(phi, &mut evaluator) {
-//!     println!("PHI always produces: {:?}", value);
-//! }
+//! assert_eq!(
+//!     analyzer.uniform_constant(phi, &mut evaluator),
+//!     Some(ConstValue::I32(10))
+//! );
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -247,6 +270,24 @@ impl<'a, T: Target> PhiAnalyzer<'a, T> {
             if let Some(block) = self.ssa.block(block_idx) {
                 for (phi_idx, phi) in block.phi_nodes().iter().enumerate() {
                     if let Some(replacement) = self.analyze_trivial(phi) {
+                        // A replacement defined by a real instruction in the phi's
+                        // own block sits *after* the block-top phi, so it cannot
+                        // dominate the phi's uses; replacing the phi with it would
+                        // create a use-before-def (`IntraBlockCycle`). This arises
+                        // for a loop-carried phi that looks trivial once an
+                        // unreachable predecessor operand is dropped — its lone
+                        // remaining operand is the loop-body (back-edge) value.
+                        // Skip such phis: leaving the phi in place is always sound.
+                        let same_block_instr_def = match replacement {
+                            Some(source) => self.ssa.variable(source).is_some_and(|var| {
+                                let site = var.def_site();
+                                site.block == block_idx && site.instruction.is_some()
+                            }),
+                            None => false,
+                        };
+                        if same_block_instr_def {
+                            continue;
+                        }
                         trivial.push((block_idx, phi_idx, replacement));
                     }
                 }
@@ -488,13 +529,19 @@ pub fn place_pruned_phis<T: Target>(
 mod tests {
     use super::*;
 
+    use std::collections::BTreeSet;
+
     use crate::{
         ir::{
+            block::SsaBlock,
             function::SsaFunction,
+            instruction::SsaInstruction,
+            ops::SsaOp,
             phi::{PhiNode, PhiOperand},
-            variable::{SsaVarId, VariableOrigin},
+            value::ConstValue,
+            variable::{DefSite, SsaVarId, VariableOrigin},
         },
-        testing::MockTarget,
+        testing::{MockTarget, MockType},
     };
 
     #[test]
@@ -546,6 +593,56 @@ mod tests {
         phi.add_operand(PhiOperand::new(v0, 0));
         phi.add_operand(PhiOperand::new(v1, 1));
         assert_eq!(analyzer.is_trivial(&phi), None);
+    }
+
+    /// A phi whose lone (trivial) operand is defined by an instruction in the
+    /// phi's own block must NOT be reported by `find_all_trivial`: the source
+    /// sits after the block-top phi, so replacing the phi with it would create a
+    /// use-before-def (`IntraBlockCycle`). This is the loop-carried-phi case that
+    /// surfaced after an unreachable predecessor operand was dropped.
+    #[test]
+    fn find_all_trivial_skips_same_block_instruction_replacement() {
+        let make = |src_def: DefSite| {
+            let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 2);
+            let phi_res = SsaVarId::from_index(0);
+            ssa.create_variable(VariableOrigin::Local(0), 0, DefSite::phi(0), MockType::I32);
+            let v_src = SsaVarId::from_index(1);
+            ssa.create_variable(VariableOrigin::Local(1), 0, src_def, MockType::I32);
+
+            let mut b0 = SsaBlock::new(0);
+            b0.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+                dest: v_src,
+                value: ConstValue::I32(1),
+            }));
+            let mut phi = PhiNode::new(phi_res, VariableOrigin::Local(0));
+            phi.add_operand(PhiOperand::new(v_src, 0));
+            b0.add_phi(phi);
+            b0.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
+                value: Some(phi_res),
+            }));
+            ssa.add_block(b0);
+            ssa.recompute_uses();
+            ssa
+        };
+
+        let reachable: BTreeSet<usize> = [0usize].into_iter().collect();
+
+        // Same-block instruction def → skipped (would create an IntraBlockCycle).
+        let ssa = make(DefSite::instruction(0, 0));
+        assert!(
+            PhiAnalyzer::new(&ssa)
+                .find_all_trivial(&reachable)
+                .is_empty(),
+            "same-block-instruction replacement must not be reported trivial"
+        );
+
+        // Control: a def in another (dominating) block is a valid replacement.
+        let ssa = make(DefSite::instruction(1, 0));
+        assert_eq!(
+            PhiAnalyzer::new(&ssa).find_all_trivial(&reachable).len(),
+            1,
+            "a replacement defined outside the phi's block stays trivial"
+        );
     }
 
     #[test]

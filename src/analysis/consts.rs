@@ -432,8 +432,17 @@ pub fn evaluate_const_op<T: Target>(
             l.mul_checked(&r, *unsigned, ptr_size)
         }
 
-        // Type conversion
-        SsaOp::Conv {
+        // Type conversions. Integer→integer and float→integer carry both the
+        // signedness and the (CIL) overflow-check; integer→float carries only
+        // signedness; the pointer and float-width conversions carry neither.
+        SsaOp::IntConv {
+            operand,
+            target,
+            overflow_check,
+            unsigned,
+            ..
+        }
+        | SsaOp::FloatToInt {
             operand,
             target,
             overflow_check,
@@ -447,6 +456,35 @@ pub fn evaluate_const_op<T: Target>(
             } else {
                 v.convert_to(target, *unsigned, ptr_bytes)
             }
+        }
+        SsaOp::IntToFloat {
+            operand,
+            target,
+            unsigned,
+            ..
+        } => {
+            let v = get_const(*operand)?;
+            v.convert_to(target, *unsigned, ptr_size.bytes() as u32)
+        }
+        // Pointers are unsigned: a pointer-width value must zero-extend, never
+        // sign-extend. Passing `false` here would widen a 32-bit `0x8000_0000`
+        // to `0xFFFF_FFFF_8000_0000` on a 64-bit target.
+        SsaOp::IntToPtr {
+            operand, target, ..
+        }
+        | SsaOp::PtrToInt {
+            operand, target, ..
+        } => {
+            let v = get_const(*operand)?;
+            v.convert_to(target, true, ptr_size.bytes() as u32)
+        }
+
+        // Float-to-float width change only; source signedness is meaningless.
+        SsaOp::FloatConv {
+            operand, target, ..
+        } => {
+            let v = get_const(*operand)?;
+            v.convert_to(target, false, ptr_size.bytes() as u32)
         }
 
         // Rotates
@@ -972,7 +1010,7 @@ mod tests {
         );
         assert_eq!(
             evaluate_const_op(
-                &SsaOp::Conv {
+                &SsaOp::IntConv {
                     dest: var(9),
                     operand: var(0),
                     target: MockType::I64,

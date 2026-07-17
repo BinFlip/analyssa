@@ -46,7 +46,7 @@ use crate::graph::{NodeId, Successors};
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId, algorithms::dfs};
 ///
 /// let mut graph: DirectedGraph<char, ()> = DirectedGraph::new();
@@ -150,7 +150,7 @@ impl<G: Successors> Iterator for DfsIterator<'_, G> {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId, algorithms::dfs};
 ///
 /// let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -264,7 +264,7 @@ impl<G: Successors> Iterator for BfsIterator<'_, G> {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId, algorithms::bfs};
 ///
 /// let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -309,7 +309,7 @@ pub fn bfs<G: Successors>(graph: &G, start: NodeId) -> BfsIterator<'_, G> {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId, algorithms::postorder};
 ///
 /// let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -406,7 +406,7 @@ pub fn postorder<G: Successors>(graph: &G, start: NodeId) -> Vec<NodeId> {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId, algorithms::reverse_postorder};
 ///
 /// let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();

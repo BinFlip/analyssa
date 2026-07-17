@@ -91,16 +91,29 @@ use crate::{
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use analyssa::{analysis::dataflow::{ConstantPropagation, ScalarValue}, PointerSize};
+/// ```rust
+/// use analyssa::{
+///     analysis::{
+///         dataflow::{ConstantPropagation, ScalarValue},
+///         SsaCfg,
+///     },
+///     ir::SsaVarId,
+///     testing, PointerSize,
+/// };
+///
+/// // `const_i32_return(42)` is `v0 = 42; return v0`.
+/// let ssa = testing::const_i32_return(42);
+/// let graph = SsaCfg::from_ssa(&ssa);
 ///
 /// let mut sccp = ConstantPropagation::new(PointerSize::Bit64);
 /// let results = sccp.analyze(&ssa, &graph);
 ///
-/// // Check if a variable is constant
-/// if let Some(ScalarValue::Constant(c)) = results.get_value(var_id) {
-///     println!("{} = {}", var_id, c);
-/// }
+/// // Check if a variable is constant.
+/// let var_id = SsaVarId::from_index(0);
+/// assert!(matches!(
+///     results.get_value(var_id),
+///     Some(ScalarValue::Constant(_))
+/// ));
 /// ```
 pub struct ConstantPropagation<T: Target> {
     /// Current value for each SSA variable.
@@ -198,7 +211,7 @@ impl<T: Target> ConstantPropagation<T> {
 
         // Mark entry block as executable
         let entry = cfg.entry().index();
-        self.executable_blocks.insert(entry);
+        self.mark_block_executable(entry);
 
         // Add entry block's outgoing edges to CFG worklist
         // For unconditional edges or first visit, add all successors
@@ -226,7 +239,7 @@ impl<T: Target> ConstantPropagation<T> {
                     // when this edge is being added, it's a back edge (loop).
                     // PHI operands from back edges represent values that change
                     // across loop iterations and should be treated as unknown.
-                    if self.executable_blocks.contains(to) {
+                    if self.is_block_executable(to) {
                         self.back_edges.insert((from, to));
                     }
                     // This edge became executable
@@ -256,10 +269,10 @@ impl<T: Target> ConstantPropagation<T> {
     where
         G: RootedGraph + Successors,
     {
-        let first_visit = !self.executable_blocks.contains(to);
+        let first_visit = !self.is_block_executable(to);
 
         if first_visit {
-            self.executable_blocks.insert(to);
+            self.mark_block_executable(to);
 
             // Process all definitions in the block
             if let Some(block) = ssa.block(to) {
@@ -308,7 +321,7 @@ impl<T: Target> ConstantPropagation<T> {
                 let block_id = use_site.block;
 
                 // Skip if block is not executable
-                if !self.executable_blocks.contains(block_id) {
+                if !self.is_block_executable(block_id) {
                     continue;
                 }
 
@@ -430,6 +443,25 @@ impl<T: Target> ConstantPropagation<T> {
         if !self.executable_edges.contains(&(from, to)) {
             self.cfg_worklist.push_back((from, to));
         }
+    }
+
+    /// Returns `true` if `block` is currently marked executable.
+    ///
+    /// Block indices flow in from terminator targets, which the IR permits to
+    /// be out of range — a terminator may reference a block that was never
+    /// recovered (common in stripped/obfuscated binaries), and the
+    /// [`crate::analysis::verifier`] explicitly tolerates such dangling
+    /// successors. The `executable_blocks` bitset is sized to exactly
+    /// `block_count`, so an out-of-range target is by definition unreachable:
+    /// report it `false` instead of indexing past the bitset and panicking.
+    fn is_block_executable(&self, block: usize) -> bool {
+        self.executable_blocks.contains_checked(block)
+    }
+
+    /// Marks `block` executable, ignoring out-of-range indices (see
+    /// [`Self::is_block_executable`]).
+    fn mark_block_executable(&mut self, block: usize) {
+        self.executable_blocks.insert_checked(block);
     }
 
     /// Evaluates a phi node to get its current value.
@@ -678,9 +710,13 @@ impl<T: Target> SccpResult<T> {
     }
 
     /// Returns `true` if a block is executable (reachable).
+    ///
+    /// An out-of-range `block` index (past the analyzed `block_count`) is
+    /// reported `false` rather than panicking — terminator targets may be
+    /// dangling and callers should treat unknown blocks as unreachable.
     #[must_use]
     pub fn is_block_executable(&self, block: usize) -> bool {
-        self.executable_blocks.contains(block)
+        block < self.executable_blocks.len() && self.executable_blocks.contains(block)
     }
 
     /// Returns an iterator over all constant variables.
@@ -719,9 +755,17 @@ mod tests {
     use super::*;
 
     use crate::{
-        analysis::dataflow::lattice::MeetSemiLattice,
-        ir::{value::ConstValue, variable::SsaVarId},
-        testing::MockTarget,
+        analysis::{cfg::SsaCfg, dataflow::lattice::MeetSemiLattice},
+        ir::{
+            block::SsaBlock,
+            function::SsaFunction,
+            instruction::SsaInstruction,
+            ops::SsaOp,
+            value::ConstValue,
+            variable::{DefSite, SsaVarId, VariableOrigin},
+        },
+        testing::{MockTarget, MockType},
+        PointerSize,
     };
 
     type Sv = ScalarValue<MockTarget>;
@@ -801,8 +845,51 @@ mod tests {
         assert!(result.is_block_executable(0));
         assert!(result.is_block_executable(1));
         assert!(!result.is_block_executable(2));
+        // Out-of-range index is reported unreachable, never a panic.
+        assert!(!result.is_block_executable(9_999));
 
         assert_eq!(result.constant_count(), 1);
         assert_eq!(result.executable_block_count(), 2);
+    }
+
+    #[test]
+    fn out_of_range_branch_targets_do_not_panic() {
+        // A terminator may reference a block that was never recovered. SCCP's
+        // `executable_blocks` bitset is sized to `block_count`, so an
+        // out-of-range target index used to panic in `BitSet::contains`. The
+        // analysis must instead treat it as unreachable. The condition is an
+        // unconstrained argument (`Bottom`), so both edges — including the
+        // dangling one — are explored.
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 1);
+        let cond = ssa.create_variable(
+            VariableOrigin::Argument(0),
+            0,
+            DefSite::entry(),
+            MockType::I32,
+        );
+
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(SsaInstruction::synthetic(SsaOp::Branch {
+            condition: cond,
+            true_target: 1,
+            // Block 99 does not exist — only blocks 0 and 1 are present.
+            false_target: 99,
+        }));
+        ssa.add_block(b0);
+
+        let mut b1 = SsaBlock::new(1);
+        b1.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: None }));
+        ssa.add_block(b1);
+        ssa.recompute_uses();
+
+        let cfg = SsaCfg::from_ssa(&ssa);
+        let mut sccp: ConstantPropagation<MockTarget> =
+            ConstantPropagation::new(PointerSize::Bit64);
+        let result = sccp.analyze(&ssa, &cfg);
+
+        // Real blocks reachable, the dangling target never marked executable.
+        assert!(result.is_block_executable(0));
+        assert!(result.is_block_executable(1));
+        assert!(!result.is_block_executable(99));
     }
 }

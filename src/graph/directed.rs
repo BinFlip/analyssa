@@ -67,7 +67,7 @@ struct EdgeData<E> {
 ///
 /// ## Creating a Simple Graph
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId, EdgeId};
 ///
 /// let mut graph: DirectedGraph<&str, i32> = DirectedGraph::new();
@@ -88,7 +88,7 @@ struct EdgeData<E> {
 ///
 /// ## Traversing the Graph
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId, Successors, Predecessors};
 ///
 /// let mut graph: DirectedGraph<char, ()> = DirectedGraph::new();
@@ -139,7 +139,7 @@ impl<N: Clone, E> DirectedGraph<'static, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::DirectedGraph;
     ///
     /// let graph: DirectedGraph<String, ()> = DirectedGraph::new();
@@ -172,7 +172,7 @@ impl<N: Clone, E> DirectedGraph<'static, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::DirectedGraph;
     ///
     /// // Pre-allocate for a graph with ~100 nodes and ~300 edges
@@ -205,7 +205,7 @@ impl<N: Clone, E> DirectedGraph<'static, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::{DirectedGraph, NodeId};
     ///
     /// let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -237,7 +237,7 @@ impl<N: Clone, E> DirectedGraph<'static, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::DirectedGraph;
     ///
     /// let mut graph: DirectedGraph<String, ()> = DirectedGraph::new();
@@ -276,14 +276,17 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
-    /// use analyssa::graph::DirectedGraph;
+    /// ```rust
+    /// use analyssa::graph::{DirectedGraph, NodeId};
     ///
     /// let nodes = vec!["A", "B", "C"];
     /// let mut graph: DirectedGraph<&str, ()> = DirectedGraph::from_nodes_borrowed(&nodes);
+    /// assert_eq!(graph.node_count(), 3);
     ///
     /// // Add edges
-    /// graph.add_edge(NodeId::new(0), NodeId::new(1), ())?;
+    /// graph.add_edge(NodeId::new(0), NodeId::new(1), ()).unwrap();
+    /// assert_eq!(graph.edge_count(), 1);
+    /// assert_eq!(graph.node(NodeId::new(0)), Some(&"A"));
     /// ```
     #[must_use]
     pub fn from_nodes_borrowed(nodes: &'a [N]) -> Self {
@@ -334,7 +337,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::DirectedGraph;
     ///
     /// let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -355,7 +358,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::DirectedGraph;
     ///
     /// let mut graph: DirectedGraph<i32, ()> = DirectedGraph::new();
@@ -380,7 +383,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::{DirectedGraph, NodeId};
     ///
     /// let mut graph: DirectedGraph<char, ()> = DirectedGraph::new();
@@ -405,7 +408,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::DirectedGraph;
     ///
     /// let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -444,7 +447,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::{DirectedGraph, EdgeId};
     ///
     /// let mut graph: DirectedGraph<&str, &str> = DirectedGraph::new();
@@ -516,13 +519,13 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::DirectedGraph;
     ///
     /// let mut graph: DirectedGraph<(), &str> = DirectedGraph::new();
     /// let a = graph.add_node(());
     /// let b = graph.add_node(());
-    /// let edge = graph.add_edge(a, b, "label");
+    /// let edge = graph.add_edge(a, b, "label").unwrap();
     ///
     /// assert_eq!(graph.edge(edge), Some(&"label"));
     /// ```
@@ -556,13 +559,13 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::DirectedGraph;
     ///
     /// let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
     /// let a = graph.add_node("A");
     /// let b = graph.add_node("B");
-    /// let edge = graph.add_edge(a, b, ());
+    /// let edge = graph.add_edge(a, b, ()).unwrap();
     ///
     /// assert_eq!(graph.edge_endpoints(edge), Some((a, b)));
     /// ```
@@ -579,7 +582,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::DirectedGraph;
     ///
     /// let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -637,7 +640,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::{DirectedGraph, NodeId};
     ///
     /// let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -677,7 +680,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::{DirectedGraph, NodeId};
     ///
     /// let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -718,7 +721,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::DirectedGraph;
     ///
     /// let mut graph: DirectedGraph<&str, i32> = DirectedGraph::new();
@@ -779,7 +782,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::DirectedGraph;
     ///
     /// let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -814,7 +817,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::DirectedGraph;
     ///
     /// let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -841,7 +844,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::DirectedGraph;
     ///
     /// let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -866,7 +869,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::{DirectedGraph, NodeId};
     ///
     /// let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -895,7 +898,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::{DirectedGraph, NodeId};
     ///
     /// let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -927,7 +930,7 @@ impl<'a, N: Clone, E> DirectedGraph<'a, N, E> {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::{DirectedGraph, NodeId};
     ///
     /// let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();

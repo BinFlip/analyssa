@@ -708,7 +708,12 @@ impl<T: Target> SsaFunction<T> {
             // Unary state transforms and conversions: trace through the operand.
             SsaOp::Neg { operand, .. }
             | SsaOp::Not { operand, .. }
-            | SsaOp::Conv { operand, .. } => {
+            | SsaOp::IntConv { operand, .. }
+            | SsaOp::IntToPtr { operand, .. }
+            | SsaOp::PtrToInt { operand, .. }
+            | SsaOp::IntToFloat { operand, .. }
+            | SsaOp::FloatToInt { operand, .. }
+            | SsaOp::FloatConv { operand, .. } => {
                 self.trace_to_phi_impl(*operand, target_block, depth.saturating_add(1))
             }
 

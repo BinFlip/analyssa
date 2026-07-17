@@ -2,7 +2,8 @@
 //!
 //! Provides a generic framework for classical data flow analyses:
 //!
-//! - **Traits**: `DataFlowAnalysis`, `DataFlowCfg`, `MeetSemiLattice`
+//! - **Traits**: `DataFlowAnalysis`, `DataFlowCfg`, and the lattice traits
+//!   ([`MeetSemiLattice`], [`JoinSemiLattice`], [`Lattice`])
 //! - **Solver**: Worklist-based iterative fixpoint computation via `DataFlowSolver`
 //! - **Analyses**: Liveness (backward), reaching definitions (forward), SCCP
 //!
@@ -39,6 +40,7 @@ pub mod sccp;
 pub mod solver;
 
 pub use framework::{AnalysisResults, DataFlowAnalysis, DataFlowCfg, Direction};
+pub use lattice::{JoinSemiLattice, Lattice, MeetSemiLattice};
 pub use liveness::{LiveVariables, LivenessResult};
 pub use reaching::ReachingDefinitions;
 pub use sccp::{ConstantPropagation, ScalarValue, SccpResult};

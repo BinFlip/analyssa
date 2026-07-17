@@ -11,8 +11,8 @@ use analyssa::{
             MemoryAccessSemantics, MemoryEffectLocation, NativeClobber, NativeOpaqueData,
             NativeRegister, NativeStateAccess, NativeStateAccessKind, NativeStateLocation,
             SsaEffectKind, SsaEffects, SsaOp, TrapClass, VectorBinaryKind, VectorBitmaskKind,
-            VectorCompareKind, VectorFaultMode, VectorMaskBinaryKind, VectorMaskMode,
-            VectorReduceKind, VectorSegmentLayout,
+            VectorCompareKind, VectorElement, VectorFaultMode, VectorMaskBinaryKind,
+            VectorMaskMode, VectorReduceKind, VectorSegmentLayout,
         },
         phi::{PhiNode, PhiOperand},
         value::ConstValue,
@@ -685,6 +685,7 @@ fn verifier_accepts_matching_vector_binary_shapes() {
         left,
         right,
         kind: VectorBinaryKind::Add,
+        element: VectorElement::default(),
     }));
     ssa.add_block(block);
     ssa.recompute_uses();
@@ -715,6 +716,7 @@ fn verifier_rejects_mismatched_vector_binary_shapes() {
         left,
         right,
         kind: VectorBinaryKind::Add,
+        element: VectorElement::default(),
     }));
     ssa.add_block(block);
     ssa.recompute_uses();
@@ -812,6 +814,7 @@ fn verifier_accepts_scalable_vector_binary_and_compare() {
         left,
         right,
         kind: VectorBinaryKind::Add,
+        element: VectorElement::default(),
     }));
     block.add_instruction(instr(SsaOp::VectorCompare {
         dest: mask,
@@ -855,6 +858,7 @@ fn verifier_rejects_fixed_and_scalable_vector_mix() {
         left: fixed,
         right: scalable,
         kind: VectorBinaryKind::Add,
+        element: VectorElement::default(),
     }));
     ssa.add_block(block);
     ssa.recompute_uses();

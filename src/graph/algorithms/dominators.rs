@@ -59,7 +59,7 @@ use crate::{
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId, algorithms::compute_dominators};
 ///
 /// // Simple CFG: entry -> a -> b -> exit
@@ -170,7 +170,7 @@ impl DominatorTree {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::{DirectedGraph, NodeId, algorithms::compute_dominators};
     ///
     /// let mut graph: DirectedGraph<(), ()> = DirectedGraph::new();
@@ -284,7 +284,7 @@ impl Iterator for DominatorIterator<'_> {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId, algorithms::compute_dominators};
 ///
 /// // Diamond CFG:
@@ -642,7 +642,7 @@ impl LengauerTarjan {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId, algorithms::{compute_dominators, compute_dominance_frontiers}};
 ///
 /// // Diamond CFG with join point

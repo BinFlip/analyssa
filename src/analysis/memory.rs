@@ -76,17 +76,38 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
-//! use analyssa::analysis::{MemorySsa, SsaCfg};
+//! ```rust
+//! use analyssa::{
+//!     analysis::{
+//!         memory::{MemoryLocation, MemorySsa},
+//!         SsaCfg,
+//!     },
+//!     ir::SsaVarId,
+//!     testing,
+//! };
 //!
+//! // Fixture that stores to `object.field1`, loads it back, then performs
+//! // an indirect store and an atomic exchange.
+//! let ssa = testing::memory_effect_fixture();
 //! let cfg = SsaCfg::from_ssa(&ssa);
 //! let mem_ssa = MemorySsa::build(&ssa, &cfg);
 //!
-//! // Query memory version at a specific point
-//! let loc = MemoryLocation::StaticField(field_token);
-//! if let Some(version) = mem_ssa.version_at_block(&loc, block_idx) {
-//!     println!("Memory version: {}", version);
-//! }
+//! // The store and the load are attributed to the same memory location.
+//! let object = SsaVarId::from_index(0);
+//! let loc = MemoryLocation::InstanceField(object, 1);
+//! assert!(mem_ssa.locations().contains(&loc));
+//!
+//! // Query the memory version entering and leaving a block: the store in
+//! // block 0 bumps the version of that location.
+//! assert_eq!(mem_ssa.version_at_entry(&loc, 0), Some(0));
+//! assert_eq!(mem_ssa.version_at_exit(&loc, 0), Some(1));
+//!
+//! // A must-alias query holds for the identical location...
+//! assert!(loc.must_alias(&loc));
+//!
+//! // ...but a distinct field of the same object does not alias it.
+//! let other = MemoryLocation::InstanceField(object, 2);
+//! assert!(!loc.may_alias(&other));
 //! ```
 //!
 //! # References

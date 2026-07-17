@@ -55,15 +55,27 @@ use crate::{
 ///
 /// # Usage
 ///
-/// ```rust,ignore
-/// use analyssa::analysis::dataflow::{DataFlowSolver, ReachingDefinitions};
+/// ```rust
+/// use analyssa::{
+///     analysis::{
+///         dataflow::{DataFlowSolver, ReachingDefinitions},
+///         SsaCfg,
+///     },
+///     ir::SsaVarId,
+///     testing,
+/// };
+///
+/// let ssa = testing::diamond_phi_fixture();
+/// let graph = SsaCfg::from_ssa(&ssa);
 ///
 /// let analysis = ReachingDefinitions::new(&ssa);
-/// let mut solver = DataFlowSolver::new(analysis);
+/// let solver = DataFlowSolver::new(analysis);
 /// let results = solver.solve(&ssa, &graph);
 ///
-/// // Access results
-/// let in_state = results.in_state(block_id);
+/// // Access results: the branch condition defined in block 0 reaches block 1.
+/// let condition = SsaVarId::from_index(0);
+/// let in_state = results.in_state(1).unwrap();
+/// assert!(in_state.definitions().any(|var| var == condition));
 /// ```
 pub struct DataFlowSolver<T: Target, A: DataFlowAnalysis<T>> {
     /// The analysis being solved.

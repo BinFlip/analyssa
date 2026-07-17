@@ -49,6 +49,35 @@
 //! ([`Event`], [`EventLog`], [`EventKind`], [`DerivedStats`]) for observing
 //! pass transformations.
 //!
+//! # Feature Flags
+//!
+//! - **`serde`** (off by default): derives `Serialize`/`Deserialize` across the
+//!   IR data model — the operation-kind taxonomy
+//!   ([`crate::ir::ops::AtomicRmwOp`], the `Vector*Kind` family,
+//!   [`crate::ir::ops::SystemOpKind`], [`crate::ir::ops::SsaOpClass`], …), the
+//!   native descriptors ([`crate::ir::ops::NativeRegister`],
+//!   [`crate::ir::ops::NativeStateLocation`],
+//!   [`crate::ir::ops::NativeInstructionMetadata`]), and the SSA graph itself:
+//!   [`crate::ir::SsaFunction`] and everything reachable from it
+//!   ([`crate::ir::SsaBlock`], [`crate::ir::SsaInstruction`],
+//!   [`crate::ir::SsaOp`], [`crate::ir::PhiNode`], [`crate::ir::SsaVariable`],
+//!   [`crate::ir::ConstValue`]).
+//!
+//!   Generic IR types carry `#[serde(bound(...))]`, so `SsaFunction<T>` is
+//!   serializable exactly when your [`Target`]'s associated types are. Hosts
+//!   that don't serialize the IR are unaffected — the impl simply does not
+//!   apply, and no serde bound is forced onto [`Target`].
+//!
+//!   [`crate::ir::SsaVarId`] serializes as its logical index, not its internal
+//!   complement encoding. Maps keyed by [`crate::ir::VariableOrigin`] encode as
+//!   `(key, value)` sequences so the IR round-trips in formats that only accept
+//!   string map keys (JSON among them).
+//!
+//!   Not covered: borrowed views ([`crate::ir::ops::SsaDefs`],
+//!   [`crate::ir::ops::MemoryEffect`]), transient pass machinery (builders,
+//!   editors, edit reports), and [`crate::ir::ops::SsaFeatureToken`] — its
+//!   `&'static str` opcode can serialize but cannot deserialize.
+//!
 //! # Design Principles
 //!
 //! - **Target agnosticism**: All IR types are generic over `<T: Target>`;

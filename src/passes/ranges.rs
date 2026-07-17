@@ -317,7 +317,7 @@ impl<T: Target> RangeAnalysis<T> {
         }
 
         let entry = cfg.entry().index();
-        self.executable_blocks.insert(entry);
+        self.mark_block_executable(entry);
         for succ in cfg.successors(cfg.entry()) {
             self.cfg_worklist.push_back((entry, succ.index()));
         }
@@ -353,9 +353,9 @@ impl<T: Target> RangeAnalysis<T> {
     where
         G: RootedGraph + Successors,
     {
-        let first_visit = !self.executable_blocks.contains(to);
+        let first_visit = !self.is_block_executable(to);
         if first_visit {
-            self.executable_blocks.insert(to);
+            self.mark_block_executable(to);
             if let Some(block) = ssa.block(to) {
                 self.process_block_definitions(block);
             }
@@ -388,7 +388,7 @@ impl<T: Target> RangeAnalysis<T> {
         if let Some(ssa_var) = ssa.variable(var) {
             for use_site in ssa_var.uses() {
                 let block_id = use_site.block;
-                if !self.executable_blocks.contains(block_id) {
+                if !self.is_block_executable(block_id) {
                     continue;
                 }
                 if use_site.is_phi_operand {
@@ -493,6 +493,26 @@ impl<T: Target> RangeAnalysis<T> {
         if !self.executable_edges.contains(&(from, to)) {
             self.cfg_worklist.push_back((from, to));
         }
+    }
+
+    /// Returns `true` if `block` is currently marked executable.
+    ///
+    /// Block indices flow in from terminator targets (`true_target`,
+    /// `false_target`, switch targets, `Jump.target`), which the IR permits to
+    /// be out of range — a terminator may reference a block that was never
+    /// recovered (common in stripped/obfuscated binaries), and the
+    /// [`crate::analysis::verifier`] explicitly tolerates such dangling
+    /// successors. The `executable_blocks` bitset is sized to exactly
+    /// `block_count`, so an out-of-range target is by definition unreachable:
+    /// report it `false` instead of indexing past the bitset and panicking.
+    fn is_block_executable(&self, block: usize) -> bool {
+        self.executable_blocks.contains_checked(block)
+    }
+
+    /// Marks `block` executable, ignoring out-of-range indices (see
+    /// [`Self::is_block_executable`]).
+    fn mark_block_executable(&mut self, block: usize) {
+        self.executable_blocks.insert_checked(block);
     }
 
     fn evaluate_phi(&self, phi: &PhiNode, block_id: usize) -> ValueRange {
@@ -965,6 +985,46 @@ mod tests {
             run(ssa, &method, &log, 20)
         });
         assert!(changed, "constant branch before phi should simplify");
+    }
+
+    #[test]
+    fn out_of_range_branch_targets_do_not_panic() {
+        // A terminator may reference a block that was never recovered (the IR
+        // permits dangling successors and the verifier tolerates them). The
+        // `executable_blocks` bitset is sized to `block_count`, so feeding it an
+        // out-of-range target index used to panic in `BitSet::contains`. The
+        // pass must instead treat the unknown target as unreachable and run
+        // cleanly. Here the condition is an unconstrained argument (range stays
+        // `top`), so both the in-range and the out-of-range edge are explored.
+        let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, 1);
+        let cond = ssa.create_variable(
+            VariableOrigin::Argument(0),
+            0,
+            DefSite::entry(),
+            MockType::I32,
+        );
+
+        let mut b0 = SsaBlock::new(0);
+        b0.add_instruction(instr(SsaOp::Branch {
+            condition: cond,
+            true_target: 1,
+            // Block 99 does not exist — only blocks 0 and 1 are present.
+            false_target: 99,
+        }));
+        ssa.add_block(b0);
+
+        let mut b1 = SsaBlock::new(1);
+        b1.add_instruction(instr(SsaOp::Return { value: None }));
+        ssa.add_block(b1);
+        ssa.recompute_uses();
+
+        let log: EventLog<MockTarget> = EventLog::new();
+        let method = 0u32;
+        let changed = run_mock_pass_boundary(&mut ssa, "out-of-range branch target", |ssa| {
+            run(ssa, &method, &log, 20)
+        });
+        // Unconstrained condition → nothing folds, and crucially no panic.
+        assert!(!changed, "unconstrained branch must not be simplified");
     }
 
     #[test]

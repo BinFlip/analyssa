@@ -27,16 +27,24 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use analyssa::{analysis::ValueResolver, ir::SsaFunction, MockTarget, PointerSize};
+//! ```rust
+//! use analyssa::{
+//!     analysis::ValueResolver,
+//!     ir::{value::ConstValue, SsaVarId},
+//!     testing, PointerSize,
+//! };
 //!
-//! let ssa: SsaFunction<MockTarget> = /* ... */;
+//! // Single block: `v0 = 42; return v0`.
+//! let ssa = testing::const_i32_return(42);
 //!
-//! let mut resolver = ValueResolver::new(&ssa, PointerSize::Bit64)
-//!     .with_path_aware_fallback();
-//! if let Some(value) = resolver.resolve(some_var) {
-//!     println!("Resolved to: {:?}", value);
-//! }
+//! let mut resolver =
+//!     ValueResolver::new(&ssa, PointerSize::Bit64).with_path_aware_fallback();
+//!
+//! let value = resolver.resolve(SsaVarId::from_index(0));
+//! assert_eq!(value, Some(ConstValue::I32(42)));
+//!
+//! // Results are cached, so resolving again returns the same value.
+//! assert_eq!(resolver.resolve(SsaVarId::from_index(0)), value);
 //! ```
 
 use crate::{

@@ -13,7 +13,7 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust
 //! use analyssa::BitSet;
 //!
 //! let mut set = BitSet::new(100);
@@ -130,6 +130,27 @@ impl BitSet {
         self.words
             .get(word)
             .is_some_and(|w| (w & (1u64 << bit)) != 0)
+    }
+
+    /// Returns `true` if the bit at `index` is set, treating an out-of-range
+    /// index as unset instead of panicking.
+    ///
+    /// Use this where the index comes from data that may legitimately name a
+    /// position outside the set — e.g. a CFG terminator referencing a block that
+    /// was never recovered, where "not in the set" is the correct answer rather
+    /// than a programming error.
+    #[must_use]
+    pub fn contains_checked(&self, index: usize) -> bool {
+        index < self.len && self.contains(index)
+    }
+
+    /// Sets the bit at `index`, ignoring an out-of-range index instead of
+    /// panicking. Returns `true` if the bit was newly set.
+    ///
+    /// The bounds-tolerant counterpart to [`Self::insert`]; see
+    /// [`Self::contains_checked`] for when that is the right behavior.
+    pub fn insert_checked(&mut self, index: usize) -> bool {
+        index < self.len && self.insert(index)
     }
 
     /// Returns the number of bits set.
@@ -314,6 +335,25 @@ mod tests {
         assert!(bs.contains(50));
         assert!(bs.contains(99));
         assert!(!bs.contains(1));
+    }
+
+    /// The bounds-tolerant accessors report/ignore out-of-range indices instead
+    /// of panicking, and otherwise behave exactly like their strict versions.
+    #[test]
+    fn checked_accessors_tolerate_out_of_range_indices() {
+        let mut bs = BitSet::new(64);
+
+        // In range: identical to `insert`/`contains`.
+        assert!(bs.insert_checked(0), "newly set bit reports true");
+        assert!(!bs.insert_checked(0), "already-set bit reports false");
+        assert!(bs.contains_checked(0));
+        assert!(!bs.contains_checked(1));
+
+        // Out of range: unset rather than a panic, and inserting is a no-op.
+        assert!(!bs.contains_checked(64));
+        assert!(!bs.contains_checked(usize::MAX));
+        assert!(!bs.insert_checked(64), "out-of-range insert sets nothing");
+        assert_eq!(bs.count(), 1, "out-of-range insert must not grow the set");
     }
 
     #[test]

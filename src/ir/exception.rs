@@ -46,6 +46,14 @@ use crate::target::Target;
 ///
 /// Generic over the host `Target` so `flags` carries a host-defined exception-kind type.
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(bound(
+        serialize = "T::ExceptionKind: serde::Serialize, T::TypeRef: serde::Serialize",
+        deserialize = "T::ExceptionKind: serde::Deserialize<'de>, T::TypeRef: serde::Deserialize<'de>"
+    ))
+)]
 pub struct SsaExceptionHandler<T: Target> {
     /// Host-defined flags identifying the handler kind:
     /// EXCEPTION, FILTER, FINALLY, or FAULT. For CIL targets, this is
@@ -99,10 +107,10 @@ pub struct SsaExceptionHandler<T: Target> {
 /// This enum provides a ready-to-use handler-kind type for frontends that target
 /// native instruction sets rather than CIL. Use it as the associated type:
 ///
-/// ```ignore
+/// ```text
 /// impl Target for MyX86Target {
 ///     type ExceptionKind = NativeExceptionKind;
-///     // ...
+///     // ... the trait's remaining items
 /// }
 /// ```
 ///
@@ -120,6 +128,7 @@ pub struct SsaExceptionHandler<T: Target> {
 /// Use [`native_is_filter_handler`] as the `Target::is_filter_handler` implementation
 /// to correctly identify `Filter` variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum NativeExceptionKind {
     /// Catch handler — runs when an exception of a matching type occurs.
     /// Maps to SEH `__except`, DWARF landing pads, and CIL `EXCEPTION`.
@@ -143,13 +152,15 @@ pub enum NativeExceptionKind {
 /// Use this as the `Target::is_filter_handler` implementation when using
 /// [`NativeExceptionKind`] as your `ExceptionKind`:
 ///
-/// ```ignore
+/// ```text
 /// impl Target for MyTarget {
 ///     type ExceptionKind = NativeExceptionKind;
 ///
 ///     fn is_filter_handler(flags: &Self::ExceptionKind) -> bool {
 ///         native_is_filter_handler(flags)
 ///     }
+///
+///     // ... the trait's remaining items
 /// }
 /// ```
 #[must_use]

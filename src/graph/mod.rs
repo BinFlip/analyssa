@@ -43,7 +43,7 @@
 //!
 //! ## Creating a Simple Graph
 //!
-//! ```rust,ignore
+//! ```rust
 //! use analyssa::graph::{DirectedGraph, NodeId};
 //!
 //! // Create a diamond-shaped graph: A -> B, A -> C, B -> D, C -> D
@@ -65,7 +65,7 @@
 //!
 //! ## Traversing a Graph
 //!
-//! ```rust,ignore
+//! ```rust
 //! use analyssa::graph::{DirectedGraph, NodeId, algorithms};
 //!
 //! let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -82,7 +82,7 @@
 //!
 //! ## Computing Dominators
 //!
-//! ```rust,ignore
+//! ```rust
 //! use analyssa::graph::{DirectedGraph, NodeId, algorithms};
 //!
 //! let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();

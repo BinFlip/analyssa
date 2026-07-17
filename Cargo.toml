@@ -1,6 +1,6 @@
 [package]
 name = "analyssa"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Johann Kempter <admin@binflip.rs>"]
 rust-version = "1.88"
@@ -25,11 +25,34 @@ panic = "deny"
 arithmetic_side_effects = "deny"
 indexing_slicing = "deny"
 
+[features]
+# Derive `serde::{Serialize, Deserialize}` across the IR data model: the whole
+# operation-kind taxonomy, the native descriptors, and the SSA graph itself
+# (`SsaFunction` and everything reachable from it -- blocks, instructions, ops,
+# phis, variables, constants, exception handlers).
+#
+# Generic IR types carry `#[serde(bound(...))]`, so `SsaFunction<T>` is
+# serializable exactly when the host's `Target` associated types are. Hosts that
+# don't serialize the IR are unaffected: the impl simply does not apply to them,
+# and nothing is forced onto `Target`.
+#
+# Not covered, deliberately: borrowed views (`SsaDefs<'a>`, `MemoryEffect<'a, T>`),
+# transient pass machinery (builders, editors, edit reports), and
+# `SsaFeatureToken` -- its `&'static str` opcode can serialize but cannot
+# deserialize, so a derive there would be a one-way trap.
+#
+# Opt-in so consumers that don't need it pull no serde.
+serde = ["dep:serde"]
+
 [dependencies]
 thiserror = "2.0.18"
 boxcar = "0.2.14"
 dashmap = "6.2.1"
 rayon = "1.12.0"
-log = "0.4.31"
+log = "0.4.33"
+num_enum = "0.7.6"
+serde = { version = "1.0.228", features = ["derive"], optional = true }
 
 [dev-dependencies]
+# Exercises the `serde` feature's round-trip guarantee (tests/serde.rs).
+serde_json = "1.0.145"

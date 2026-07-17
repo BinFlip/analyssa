@@ -311,7 +311,12 @@ impl<'a, T: Target> SymbolicEvaluator<'a, T> {
                 };
                 self.eval_binary(*dest, *left, *right, op);
             }
-            SsaOp::Conv { dest, operand, .. } => {
+            SsaOp::IntConv { dest, operand, .. }
+            | SsaOp::IntToPtr { dest, operand, .. }
+            | SsaOp::PtrToInt { dest, operand, .. }
+            | SsaOp::IntToFloat { dest, operand, .. }
+            | SsaOp::FloatToInt { dest, operand, .. }
+            | SsaOp::FloatConv { dest, operand, .. } => {
                 if let Some(expr) = self.expressions.get(operand) {
                     self.expressions.insert(*dest, expr.clone());
                 } else {

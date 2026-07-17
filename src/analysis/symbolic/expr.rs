@@ -663,14 +663,26 @@ impl<T: Target> SymbolicExpr<T> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// let expr = SymbolicExpr::binary(
+    /// ```rust
+    /// use analyssa::{
+    ///     analysis::symbolic::{SymbolicExpr, SymbolicOp},
+    ///     testing::MockTarget,
+    ///     PointerSize,
+    /// };
+    ///
+    /// let expr = SymbolicExpr::<MockTarget>::binary(
     ///     SymbolicOp::Xor,
     ///     SymbolicExpr::named("state"),
     ///     SymbolicExpr::constant_i64(0x12345678),
     /// );
-    /// let result = expr.substitute_named("state", 100);
+    ///
+    /// // Substituting the only named variable folds the whole tree away.
+    /// let result = expr.substitute_named("state", 100, PointerSize::Bit64);
     /// assert_eq!(result.as_i64(), Some(100 ^ 0x12345678));
+    ///
+    /// // Substituting an unrelated name leaves the expression symbolic.
+    /// let untouched = expr.substitute_named("other", 100, PointerSize::Bit64);
+    /// assert_eq!(untouched.as_i64(), None);
     /// ```
     #[must_use]
     pub fn substitute_named(&self, name: &str, value: i64, ptr_size: PointerSize) -> Self {

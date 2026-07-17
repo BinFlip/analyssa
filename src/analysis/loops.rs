@@ -94,13 +94,28 @@
 //! Full detection: O(B^2 + E + L^2) worst case where B is block count,
 //! E is edge count, and L is loop count. O(B log B) typical for reducible CFGs.
 //!
-//! ```rust,ignore
-//! use analyssa::analysis::detect_loops;
-//! use analyssa::graph::algorithms::compute_dominators;
+//! ```rust
+//! use analyssa::{
+//!     analysis::{detect_loops, SsaCfg},
+//!     graph::{algorithms::compute_dominators, NodeId, RootedGraph},
+//!     testing,
+//! };
 //!
 //! // Works with any graph implementing the traits
-//! let dominators = compute_dominators(&graph, entry);
+//! let ssa = testing::loop_counter_fixture();
+//! let graph = SsaCfg::from_ssa(&ssa);
+//!
+//! let dominators = compute_dominators(&graph, graph.entry());
 //! let forest = detect_loops(&graph, &dominators);
+//!
+//! // The fixture has a single self-loop headed by block 1.
+//! assert_eq!(forest.loops().len(), 1);
+//! assert_eq!(forest.loops()[0].header, NodeId::new(1));
+//!
+//! // Containment queries: block 1 is in the loop, the entry block is not.
+//! assert!(forest.is_in_loop(NodeId::new(1)));
+//! assert_eq!(forest.loop_depth(NodeId::new(1)), 1);
+//! assert!(!forest.is_in_loop(NodeId::new(0)));
 //! ```
 
 use std::collections::HashMap;
@@ -632,16 +647,27 @@ impl LoopForest {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use analyssa::analysis::detect_loops;
-/// use analyssa::graph::algorithms::compute_dominators;
+/// ```rust
+/// use analyssa::{
+///     analysis::{detect_loops, SsaCfg},
+///     graph::{algorithms::compute_dominators, NodeId, RootedGraph},
+///     testing,
+/// };
+///
+/// let ssa = testing::loop_counter_fixture();
+/// let graph = SsaCfg::from_ssa(&ssa);
 ///
 /// let dominators = compute_dominators(&graph, graph.entry());
 /// let forest = detect_loops(&graph, &dominators);
 ///
-/// for loop_info in forest.loops() {
-///     println!("Loop at {:?} with {} blocks", loop_info.header, loop_info.size());
-/// }
+/// let headers: Vec<_> = forest
+///     .loops()
+///     .iter()
+///     .map(|loop_info| (loop_info.header, loop_info.size()))
+///     .collect();
+///
+/// // One loop, headed by block 1, whose body is just that block.
+/// assert_eq!(headers, vec![(NodeId::new(1), 1)]);
 /// ```
 #[must_use]
 pub fn detect_loops<G>(graph: &G, dominators: &DominatorTree) -> LoopForest
@@ -711,14 +737,24 @@ where
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use analyssa::analysis::loops::has_back_edges;
-/// use analyssa::graph::algorithms::compute_dominators;
+/// ```rust
+/// use analyssa::{
+///     analysis::{loops::has_back_edges, SsaCfg},
+///     graph::{algorithms::compute_dominators, RootedGraph},
+///     testing,
+/// };
 ///
+/// // A loop fixture has a back edge...
+/// let looping = testing::loop_counter_fixture();
+/// let graph = SsaCfg::from_ssa(&looping);
 /// let dominators = compute_dominators(&graph, graph.entry());
-/// if has_back_edges(&graph, &dominators) {
-///     println!("Graph contains loops");
-/// }
+/// assert!(has_back_edges(&graph, &dominators));
+///
+/// // ...while an acyclic diamond CFG does not.
+/// let diamond = testing::diamond_phi_fixture();
+/// let graph = SsaCfg::from_ssa(&diamond);
+/// let dominators = compute_dominators(&graph, graph.entry());
+/// assert!(!has_back_edges(&graph, &dominators));
 /// ```
 #[must_use]
 pub fn has_back_edges<G>(graph: &G, dominators: &DominatorTree) -> bool

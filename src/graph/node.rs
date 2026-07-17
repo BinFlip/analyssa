@@ -24,7 +24,7 @@ use std::fmt;
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId};
 ///
 /// let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -63,7 +63,7 @@ impl NodeId {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::NodeId;
     ///
     /// let node = NodeId::new(0);
@@ -86,7 +86,7 @@ impl NodeId {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::NodeId;
     ///
     /// let node = NodeId::new(5);

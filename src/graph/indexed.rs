@@ -15,8 +15,8 @@
 //!
 //! # Examples
 //!
-//! ```rust,ignore
-//! use analyssa::graph::{IndexedGraph, algorithms};
+//! ```rust
+//! use analyssa::graph::IndexedGraph;
 //!
 //! // Create a graph with string keys
 //! let mut graph: IndexedGraph<&str, ()> = IndexedGraph::new();
@@ -27,14 +27,13 @@
 //! graph.add_node("C");
 //!
 //! // Add edges using domain types
-//! graph.add_edge("A", "B", ());
-//! graph.add_edge("B", "C", ());
-//! graph.add_edge("C", "A", ()); // Creates a cycle
+//! graph.add_edge("A", "B", ()).unwrap();
+//! graph.add_edge("B", "C", ()).unwrap();
+//! graph.add_edge("C", "A", ()).unwrap(); // Creates a cycle
 //!
 //! // Run algorithms - results are automatically mapped back
-//! if let Some(cycle) = graph.find_cycle_from("A") {
-//!     println!("Found cycle: {:?}", cycle); // ["A", "B", "C", "A"]
-//! }
+//! let cycle = graph.find_cycle_from(&"A").unwrap();
+//! assert_eq!(cycle, vec!["A", "B", "C", "A"]);
 //! ```
 
 use std::{

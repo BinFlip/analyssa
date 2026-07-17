@@ -63,8 +63,9 @@ use crate::{
     ir::{
         function::SsaFunction,
         ops::{
-            AtomicAccessWidth, AtomicOrdering, MemoryAccessSemantics, MemoryEffectLocation,
-            NativeClobber, NativeStateAccessKind, SsaEffectKind, SsaEffects, SsaOp,
+            AtomicAccessWidth, AtomicOrdering, ControlEffect, MemoryAccessSemantics,
+            MemoryEffectLocation, NativeClobber, NativeStateAccessKind, SsaEffectKind, SsaEffects,
+            SsaOp,
         },
         variable::{DefSite, SsaVarId, SsaVariable},
     },
@@ -1402,6 +1403,26 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
                 let effects = instr.op().effects();
                 self.check_effect_summary(block_idx, instr_idx, effects);
 
+                let is_terminator = instr.op().is_terminator();
+                let ends_block = matches!(
+                    effects.control,
+                    ControlEffect::Terminator | ControlEffect::Return | ControlEffect::Throw
+                );
+                if is_terminator && !ends_block {
+                    self.invalid_native(
+                        block_idx,
+                        instr_idx,
+                        "terminator op must declare a block-ending control effect",
+                    );
+                }
+                if ends_block && !is_terminator {
+                    self.invalid_native(
+                        block_idx,
+                        instr_idx,
+                        "op with a block-ending control effect must be a terminator",
+                    );
+                }
+
                 if let SsaOp::NativeOpaque(data) = instr.op() {
                     let clobbers = &data.clobbers;
                     let effects = &data.effects;
@@ -1582,7 +1603,13 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
             if T::is_unknown(ty) {
                 continue;
             }
-            if !T::is_integer(ty) {
+            // Native wide multiply/divide operate on the machine word as a raw
+            // integer bit-pattern. A pointer is an integer-width scalar and is a
+            // faithful operand here (e.g. `div` of an address, pointer hashing):
+            // accept integer *or* pointer types and let the width check below
+            // enforce consistency. Rejecting pointers outright produced false
+            // positives on lifted `div`/`mul` whose accumulator held a pointer.
+            if !T::is_integer(ty) && !T::is_pointer(ty) {
                 self.invalid_wide(block, instr_idx, "wide arithmetic values must be integers");
                 continue;
             }
@@ -1673,11 +1700,20 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
         dest: SsaVarId,
         expected: VectorMaskDescriptor,
     ) {
+        // A `None` expected mask type means the target does not model a
+        // distinct mask type for this lane count — the mask lives in a plain
+        // vector register (e.g. an AVX sign-bit mask), so there is no mask type
+        // to compare against. Skip, mirroring `check_source_shape`'s Some/Some
+        // guard; rejecting here would false-positive every masked op on such a
+        // target.
+        let Some(expected_ty) = T::vector_mask_descriptor_type(expected) else {
+            return;
+        };
         if let Some(ty) = self.var_type(dest) {
             if T::is_unknown(ty) {
                 return;
             }
-            if T::vector_mask_descriptor_type(expected).as_ref() != Some(ty) {
+            if &expected_ty != ty {
                 self.invalid_vector(
                     block,
                     instr_idx,
@@ -1695,11 +1731,21 @@ impl<'a, T: Target> SsaVerifier<'a, T> {
         mask: SsaVarId,
         expected: VectorMaskDescriptor,
     ) {
+        // A `None` expected mask type means the target does not model a
+        // distinct mask type for this lane count — the mask lives in a plain
+        // vector register (e.g. an AVX2 `vmaskmov`/gather sign-bit mask), so
+        // there is no mask type to compare against. Skip, mirroring
+        // `check_source_shape`'s Some/Some guard; rejecting here would
+        // false-positive every masked op whose mask register carries a
+        // concrete vector type on such a target.
+        let Some(expected_ty) = T::vector_mask_descriptor_type(expected) else {
+            return;
+        };
         if let Some(ty) = self.var_type(mask) {
             if T::is_unknown(ty) {
                 return;
             }
-            if T::vector_mask_descriptor_type(expected).as_ref() != Some(ty) {
+            if &expected_ty != ty {
                 self.invalid_vector(
                     block,
                     instr_idx,

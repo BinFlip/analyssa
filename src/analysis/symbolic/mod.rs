@@ -65,15 +65,26 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use analyssa::analysis::symbolic::{SymbolicExpr, SymbolicOp};
+//! ```rust
+//! use analyssa::{
+//!     analysis::symbolic::{SymbolicExpr, SymbolicOp},
+//!     testing::MockTarget,
+//!     PointerSize,
+//! };
 //!
-//! // Build expression: (state XOR 0x12345678) % 13
-//! let state = SymbolicExpr::named("state");
-//! let xored = SymbolicExpr::binary(SymbolicOp::Xor, state, SymbolicExpr::constant(0x12345678));
-//! let result = SymbolicExpr::binary(SymbolicOp::RemU, xored, SymbolicExpr::constant(13));
+//! // Build expression: (state XOR 0x12345678) %u 13
+//! let state = SymbolicExpr::<MockTarget>::named("state");
+//! let xored = SymbolicExpr::binary(SymbolicOp::Xor, state, SymbolicExpr::constant_i64(0x12345678));
+//! let result = SymbolicExpr::binary(SymbolicOp::RemU, xored, SymbolicExpr::constant_i64(13));
 //!
-//! // Hand `result` to a host-side solver to find states that produce case index 5.
+//! // The expression stays symbolic in `state` until it is bound.
+//! assert_eq!(result.as_i64(), None);
+//! assert!(result.named_variables().contains("state"));
+//!
+//! // Hand `result` to a host-side solver to find states that produce a given
+//! // case index; binding `state` directly evaluates the dispatch.
+//! let case = result.substitute_named("state", 5, PointerSize::Bit64);
+//! assert_eq!(case.as_i64(), Some((5 ^ 0x12345678) % 13));
 //! ```
 //!
 //! # Performance Considerations

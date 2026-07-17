@@ -28,6 +28,12 @@ optimization passes, and scheduler integration.
 - `pointer` — `PointerSize` for hosts to communicate target pointer
   width to generic passes.
 
+## Features
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `serde` | off | Derives `Serialize`/`Deserialize` across the IR data model: the operation-kind taxonomy, the native descriptors, and the SSA graph itself (`SsaFunction` and everything reachable from it). Generic types use `#[serde(bound(...))]`, so `SsaFunction<T>` serializes exactly when your `Target`'s associated types do — hosts that don't serialize the IR are unaffected, and nothing is forced onto `Target`. Excluded: borrowed views (`SsaDefs`, `MemoryEffect`), transient pass machinery (builders/editors), and `SsaFeatureToken` (its `&'static str` opcode cannot deserialize). |
+
 ## Usage
 
 A consuming crate implements the `Target` trait for its host (mapping

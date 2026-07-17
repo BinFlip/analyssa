@@ -45,7 +45,7 @@
 //!
 //! ## Traversal
 //!
-//! ```rust,ignore
+//! ```rust
 //! use analyssa::graph::{DirectedGraph, NodeId, algorithms};
 //!
 //! let mut graph: DirectedGraph<&str, ()> = DirectedGraph::new();
@@ -62,7 +62,7 @@
 //!
 //! ## Cycle Detection
 //!
-//! ```rust,ignore
+//! ```rust
 //! use analyssa::graph::{DirectedGraph, NodeId, algorithms};
 //!
 //! // Acyclic graph

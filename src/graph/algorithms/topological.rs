@@ -48,7 +48,7 @@ use crate::graph::{GraphBase, NodeId, Predecessors, Successors};
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId, algorithms::topological_sort};
 ///
 /// // A simple DAG: A -> B -> D, A -> C -> D
@@ -75,7 +75,7 @@ use crate::graph::{GraphBase, NodeId, Predecessors, Successors};
 ///
 /// # Cyclic Graph Example
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId, algorithms::topological_sort};
 ///
 /// // A graph with a cycle: A -> B -> C -> A

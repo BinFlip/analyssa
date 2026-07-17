@@ -23,13 +23,13 @@ use std::fmt;
 ///
 /// # Examples
 ///
-/// ```rust,ignore
-/// use analyssa::graph::{DirectedGraph, NodeId, EdgeId};
+/// ```rust
+/// use analyssa::graph::{DirectedGraph, EdgeId};
 ///
 /// let mut graph: DirectedGraph<&str, &str> = DirectedGraph::new();
 /// let a = graph.add_node("A");
 /// let b = graph.add_node("B");
-/// let edge: EdgeId = graph.add_edge(a, b, "A->B");
+/// let edge: EdgeId = graph.add_edge(a, b, "A->B").unwrap();
 ///
 /// // EdgeIds can be used to query edge information
 /// assert_eq!(graph.edge(edge), Some(&"A->B"));
@@ -59,7 +59,7 @@ impl EdgeId {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::EdgeId;
     ///
     /// let edge = EdgeId::new(0);
@@ -82,7 +82,7 @@ impl EdgeId {
     ///
     /// # Examples
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use analyssa::graph::EdgeId;
     ///
     /// let edge = EdgeId::new(5);

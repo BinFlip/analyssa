@@ -18,9 +18,9 @@ use crate::{
             AtomicAccessWidth, AtomicOrdering, AtomicRmwOp, BinaryOpKind, CmpKind, FenceKind,
             FlagCondition, FlagsMask, NativeClobber, NativeInstructionMetadata, NativeOpaqueData,
             SsaEffects, SsaOp, UnaryOpKind, VectorBinaryKind, VectorBitmaskKind, VectorCastKind,
-            VectorCompareKind, VectorFaultMode, VectorMaskBinaryKind, VectorMaskMode,
-            VectorMaskUnaryKind, VectorReduceKind, VectorSegmentLayout, VectorTernaryKind,
-            VectorUnaryKind,
+            VectorCompareKind, VectorElement, VectorFaultMode, VectorMaskBinaryKind,
+            VectorMaskMode, VectorMaskUnaryKind, VectorReduceKind, VectorSegmentLayout,
+            VectorTernaryKind, VectorUnaryKind,
         },
         phi::{PhiNode, PhiOperand},
         value::ConstValue,
@@ -1463,7 +1463,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         self.emit_def(def, |dest| SsaOp::BoolNot { dest, value })
     }
 
-    /// Emits a conversion operation.
+    /// Emits an integer→integer conversion operation.
     ///
     /// # Errors
     ///
@@ -1476,7 +1476,7 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         overflow_check: bool,
         unsigned: bool,
     ) -> Result<SsaVarId> {
-        self.emit_def(def, |dest| SsaOp::Conv {
+        self.emit_def(def, |dest| SsaOp::IntConv {
             dest,
             operand,
             target,
@@ -2145,6 +2145,15 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         self.emit_def(def, |dest| SsaOp::Ckfinite { dest, operand })
     }
 
+    /// Emits a floating-point classification operation (`fclass`/`class.fmt`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if instruction insertion fails.
+    pub fn fp_classify(&mut self, def: SsaDefSpec<T>, operand: SsaVarId) -> Result<SsaVarId> {
+        self.emit_def(def, |dest| SsaOp::FpClassify { dest, operand })
+    }
+
     /// Emits a native opaque operation.
     ///
     /// # Errors
@@ -2307,8 +2316,14 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         def: SsaDefSpec<T>,
         value: SsaVarId,
         kind: VectorUnaryKind,
+        element: VectorElement,
     ) -> Result<SsaVarId> {
-        self.emit_def(def, |dest| SsaOp::VectorUnary { dest, value, kind })
+        self.emit_def(def, |dest| SsaOp::VectorUnary {
+            dest,
+            value,
+            kind,
+            element,
+        })
     }
 
     /// Emits a vector binary operation.
@@ -2322,12 +2337,14 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
         left: SsaVarId,
         right: SsaVarId,
         kind: VectorBinaryKind,
+        element: VectorElement,
     ) -> Result<SsaVarId> {
         self.emit_def(def, |dest| SsaOp::VectorBinary {
             dest,
             left,
             right,
             kind,
+            element,
         })
     }
 
@@ -3125,13 +3142,13 @@ impl<'a, T: Target> SsaBlockBuilder<'a, T> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        analysis::verifier::VerifyLevel,
+        analysis::verifier::{SsaVerifier, VerifierError, VerifyLevel},
         ir::{
             function::VectorFaultingLoadSpec,
             ops::{
                 AtomicAccessWidth, AtomicOrdering, FlagCondition, FlagsMask, SsaEffectKind,
-                SsaEffects, VectorBinaryKind, VectorCompareKind, VectorFaultMode, VectorMaskMode,
-                VectorSegmentLayout,
+                SsaEffects, VectorBinaryKind, VectorCompareKind, VectorElement, VectorFaultMode,
+                VectorMaskMode, VectorSegmentLayout,
             },
             variable::{DefSite, SsaVarId, VariableOrigin},
             ConstValue, SsaDefSpec, SsaFunctionBuilder,
@@ -3153,6 +3170,54 @@ mod tests {
 
     fn mask4_tmp() -> SsaDefSpec<MockTarget> {
         SsaDefSpec::tmp(MockType::Mask4)
+    }
+
+    fn v2f64_tmp() -> SsaDefSpec<MockTarget> {
+        SsaDefSpec::tmp(MockType::V2F64)
+    }
+
+    /// A masked vector op whose lane count the target does not model as a
+    /// distinct mask type must still verify. `MockTarget` maps only 4-lane
+    /// masks (`Mask4`), so a 2-lane (`V2F64`) masked load's
+    /// `vector_mask_descriptor_type` is `None` — meaning "target models no
+    /// mask type for this shape", exactly like `VisusTarget` (which returns
+    /// `None` for every shape and carries an AVX `vmaskmov` mask in a plain
+    /// vector register). The verifier must skip the mask-shape check in that
+    /// case rather than reject a concretely-typed mask operand. Regression for
+    /// the ~127-fn x86_64 "mask operand is not compatible with vector lane
+    /// count" false-positive class.
+    #[test]
+    fn masked_op_verifies_when_target_models_no_mask_type_for_lane_count() {
+        let mut builder = SsaFunctionBuilder::<MockTarget>::new(0, 0);
+        builder
+            .in_block(0, |block| {
+                let addr = block.const_value(ptr_tmp(), ConstValue::NativeUInt(0x2000))?;
+                // The mask register carries a concrete 2-lane vector type — the
+                // shape `MockTarget` does not model as a distinct mask type.
+                let mask = block.vector_load(v2f64_tmp(), addr, MockType::V2F64)?;
+                let loaded = block.vector_masked_load(
+                    v2f64_tmp(),
+                    addr,
+                    mask,
+                    None,
+                    MockType::V2F64,
+                    VectorMaskMode::Zero,
+                )?;
+                block.ret(Some(loaded))?;
+                Ok(())
+            })
+            .unwrap();
+        let function = builder.finish().unwrap();
+        let errors = SsaVerifier::new(&function).verify(VerifyLevel::Standard);
+        assert!(
+            !errors.iter().any(|error| matches!(
+                error,
+                VerifierError::InvalidVectorOperation { reason, .. }
+                    if reason.contains("mask operand is not compatible")
+            )),
+            "masked op must verify when the target models no mask type for the \
+             lane count: {errors:?}"
+        );
     }
 
     #[test]
@@ -3317,8 +3382,13 @@ mod tests {
                 let scalar = block.const_i32(i32_tmp(), 9)?;
                 let vector = block.vector_splat(v4i32_tmp(), scalar, MockType::V4I32)?;
                 let loaded = block.vector_load(v4i32_tmp(), addr, MockType::V4I32)?;
-                let added =
-                    block.vector_binary(v4i32_tmp(), vector, loaded, VectorBinaryKind::Add)?;
+                let added = block.vector_binary(
+                    v4i32_tmp(),
+                    vector,
+                    loaded,
+                    VectorBinaryKind::Add,
+                    VectorElement::default(),
+                )?;
                 let mask = block.vector_compare(
                     mask4_tmp(),
                     added,

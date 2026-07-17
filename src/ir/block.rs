@@ -105,6 +105,18 @@ impl std::ops::Add for ReplaceResult {
 /// block.add_instruction(SsaInstruction::synthetic(SsaOp::Return { value: Some(result) }));
 /// ```
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(bound(
+        serialize = "T::Type: serde::Serialize, T::TypeRef: serde::Serialize, \
+                     T::MethodRef: serde::Serialize, T::FieldRef: serde::Serialize, \
+                     T::SigRef: serde::Serialize, T::OriginalInstruction: serde::Serialize",
+        deserialize = "T::Type: serde::Deserialize<'de>, T::TypeRef: serde::Deserialize<'de>, \
+                       T::MethodRef: serde::Deserialize<'de>, T::FieldRef: serde::Deserialize<'de>, \
+                       T::SigRef: serde::Deserialize<'de>, T::OriginalInstruction: serde::Deserialize<'de>"
+    ))
+)]
 pub struct SsaBlock<T: Target> {
     /// Block index (matches CFG block index).
     id: usize,

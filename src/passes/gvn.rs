@@ -6,12 +6,20 @@
 //!
 //! # Algorithm
 //!
-//! 1. **Key construction**: For each pure operation (binary, unary,
-//!    `LoadArg`), build a hashable value key from its opcode and
-//!    operands. Commutative operations are normalized so that
-//!    `a + b` and `b + a` produce the same key. Overflow-checked
-//!    operations (`AddOvf`, `SubOvf`, `MulOvf`) and `Ckfinite` are
-//!    excluded (they may throw).
+//! 1. **Key construction**: For each pure operation, build a hashable value key
+//!    from its opcode and operands. Binary, unary, and `LoadArg` ops get
+//!    dedicated keys; every other pure single-result op falls back to a generic
+//!    key built from its operand-normalized shape. Commutative operations are
+//!    normalized so that `a + b` and `b + a` produce the same key.
+//!
+//!    Exclusions fall into two groups. **Not pure**: overflow-checked
+//!    arithmetic (`AddOvf`, `SubOvf`, `MulOvf`), `Ckfinite`, anything touching
+//!    memory, and the carry-coupled rotates (`Rcl`/`Rcr`, which carry a hidden
+//!    flag dependence). **Pure but not a function of their SSA operands**:
+//!    `Const` (handled by constant folding), `ComputeFlags` (carries no opcode
+//!    discriminator), `CallClobber` (defines fresh undefined values), and `Phi`
+//!    (block-relative). Multi-result ops are excluded by the single-def gate,
+//!    since GVN cannot remap their secondary definitions.
 //! 2. **Hash-consing**: If the same value key was seen before, the
 //!    later definition is redundant — queue it for replacement.
 //! 3. **Replacement**: For each redundant result, call
@@ -28,8 +36,12 @@
 //!
 //! # Complexity
 //!
-//! O(n) in the number of instructions — a single linear scan plus hash
-//! map lookups.
+//! O(n) in the number of instructions — a single linear scan plus hash map
+//! lookups.
+//!
+//! The generic key stores the operand-normalized [`SsaOp`] itself, so probing
+//! is a structural `Eq`/`Hash` comparison with no formatting, no `String`
+//! allocation, and no possibility of two distinct ops colliding onto one key.
 
 use std::collections::HashMap;
 
@@ -40,7 +52,7 @@ use crate::{
     graph::{algorithms::compute_dominators, RootedGraph},
     ir::{
         function::{SsaEditOptions, SsaFunction, SsaRollbackPolicy},
-        ops::{BinaryOpKind, SsaOp, UnaryOpKind},
+        ops::{BinaryOpKind, OperandRole, SsaOp, UnaryOpKind},
         variable::SsaVarId,
     },
     target::Target,
@@ -75,7 +87,7 @@ where
 /// operands, not the destination. Two operations with the same key compute
 /// the same value and are candidates for elimination.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum ValueKey {
+enum ValueKey<T: Target> {
     /// A binary operation.
     ///
     /// Fields: `(kind, unsigned_flag, left_operand, right_operand)`.
@@ -96,18 +108,37 @@ enum ValueKey {
     /// single function invocation. The field is the zero-based argument
     /// index.
     LoadArg(usize),
+    /// Any other pure, single-result operation.
+    ///
+    /// The key is the operation itself with its definitions normalized to a
+    /// fixed sentinel, compared structurally via the op's derived `Eq`/`Hash`.
+    /// Two ops are equal iff they have the same opcode, the same immediate
+    /// fields, and the same use operands — i.e. they compute the same value.
+    /// Because equality is derived, every field participates automatically, so
+    /// this arm covers all pure ops (vector compute, conversions, bit
+    /// manipulation, `Select`, …) — current and future — with no per-op code.
+    Generic(Box<SsaOp<T>>),
 }
 
-impl ValueKey {
+impl<T: Target> ValueKey<T> {
     /// Builds a normalized value key from an SSA operation. Returns `None`
     /// for operations that should not be value-numbered (impure operations,
     /// constants, control flow, etc.).
-    fn from_op<T: Target>(op: &SsaOp<T>) -> Option<(Self, SsaVarId)> {
+    fn from_op(op: &SsaOp<T>) -> Option<(Self, SsaVarId)> {
         if let Some(info) = op.as_binary_op() {
-            // Skip overflow-checked operations (they may throw).
+            // Skip overflow-checked operations (they may throw) and the
+            // carry-coupled rotates `Rcl`/`Rcr`, which read and write the carry
+            // flag — a hidden input/output not present in their SSA operands, so
+            // they are not a pure function of those operands and must not be
+            // value-numbered. (`as_binary_op` exposes them as binary ops, so the
+            // generic purity gate below is never reached for them.)
             if matches!(
                 info.kind,
-                BinaryOpKind::AddOvf | BinaryOpKind::SubOvf | BinaryOpKind::MulOvf
+                BinaryOpKind::AddOvf
+                    | BinaryOpKind::SubOvf
+                    | BinaryOpKind::MulOvf
+                    | BinaryOpKind::Rcl
+                    | BinaryOpKind::Rcr
             ) {
                 return None;
             }
@@ -128,9 +159,61 @@ impl ValueKey {
             return Some((Self::LoadArg(*arg_index as usize), *dest));
         }
 
-        None
+        // Generic fallback: any *pure*, single-result op. Gating on
+        // `effects().is_pure()` excludes everything that reads/writes memory, is
+        // atomic, may throw (overflow-checked arithmetic, `Ckfinite`), or is a
+        // carry-coupled rotate (`Rcl`/`Rcr`, which carry a hidden flag
+        // dependence). The single-def gate excludes flag-producing and wide
+        // multi-result ops whose secondary definitions GVN cannot remap.
+        //
+        // Purity alone is not sufficient: the ops below are pure yet are still
+        // not a function of their SSA operands, so the generic key cannot
+        // distinguish them.
+        //
+        // * `Const` — constant materialization is handled by constant folding /
+        //   propagation, not value numbering.
+        // * `ComputeFlags` — models the flags of `bsf`/`bsr`/`popcnt`/`bt`
+        //   alike but carries no opcode discriminator, so two different native
+        //   flag computations over the same operands key identically.
+        // * `CallClobber` — defines *fresh, undefined* values for caller-saved
+        //   registers. Its operands are all `Def`s, which normalize to the
+        //   sentinel below, so every single-output clobber in a function would
+        //   key identically and one call's clobbered register would be
+        //   forwarded to another's.
+        // * `Phi` — block-relative by definition; the key omits the block the
+        //   phi heads.
+        if matches!(
+            op,
+            SsaOp::Const { .. }
+                | SsaOp::ComputeFlags { .. }
+                | SsaOp::CallClobber { .. }
+                | SsaOp::Phi { .. }
+        ) || !op.effects().is_pure()
+        {
+            return None;
+        }
+        let defs: Vec<SsaVarId> = op.defs().collect();
+        let [dest] = defs[..] else {
+            return None;
+        };
+        let mut normalized = op.clone();
+        normalized.visit_operands_mut(|role, var| {
+            if matches!(role, OperandRole::Def | OperandRole::FlagsDef) {
+                *var = GVN_DEF_SENTINEL;
+            }
+        });
+        Some((Self::Generic(Box::new(normalized)), dest))
     }
 }
+
+/// Sentinel SSA id substituted for an operation's definition when building a
+/// [`ValueKey::Generic`] key, so the destination name does not distinguish two
+/// otherwise-identical computations.
+///
+/// Uses [`SsaVarId::PLACEHOLDER`] rather than a real index: `from_index(0)` is a
+/// live variable id, so a key built from it is indistinguishable from one whose
+/// destination genuinely is `v0`.
+const GVN_DEF_SENTINEL: SsaVarId = SsaVarId::PLACEHOLDER;
 
 /// Internal GVN driver. Returns the number of uses replaced (used by tests).
 fn run_gvn<T, L>(ssa: &mut SsaFunction<T>, method: &T::MethodRef, events: &L) -> usize
@@ -138,7 +221,7 @@ where
     T: Target,
     L: EventListener<T> + ?Sized,
 {
-    let mut value_map: HashMap<ValueKey, SsaVarId> = HashMap::new();
+    let mut value_map: HashMap<ValueKey<T>, SsaVarId> = HashMap::new();
     let mut redundant: Vec<(SsaVarId, SsaVarId, usize, usize)> = Vec::new();
 
     for block in ssa.blocks() {
@@ -332,6 +415,117 @@ mod tests {
             value: ConstValue::I32(42),
         };
         assert!(ValueKey::from_op(&const_op).is_none());
+    }
+
+    /// The generic key value-numbers any pure, single-result op (here `Select`,
+    /// which the curated binary/unary/load arms do not cover) by structural
+    /// identity, while excluding impure ops. This is what lets GVN cover the
+    /// ~150 vector/native ops with no per-op code.
+    #[test]
+    fn generic_value_key_covers_pure_ops_and_skips_impure() {
+        let v0 = SsaVarId::from_index(0);
+        let v1 = SsaVarId::from_index(1);
+        let v2 = SsaVarId::from_index(2);
+        let v3 = SsaVarId::from_index(3);
+        let v4 = SsaVarId::from_index(4);
+
+        // Two `Select`s with the same inputs compute the same value despite
+        // different destinations -> identical generic key, distinct dests.
+        let sel1: SsaOp<MockTarget> = SsaOp::Select {
+            dest: v3,
+            condition: v0,
+            true_val: v1,
+            false_val: v2,
+        };
+        let sel2: SsaOp<MockTarget> = SsaOp::Select {
+            dest: v4,
+            condition: v0,
+            true_val: v1,
+            false_val: v2,
+        };
+        let (k1, d1) = ValueKey::from_op(&sel1).expect("select is pure single-def");
+        let (k2, d2) = ValueKey::from_op(&sel2).expect("select is pure single-def");
+        assert!(matches!(k1, ValueKey::Generic(_)));
+        assert_eq!(k1, k2, "same computation -> same key");
+        assert_eq!((d1, d2), (v3, v4));
+
+        // Differing input operand -> different key.
+        let sel3: SsaOp<MockTarget> = SsaOp::Select {
+            dest: v4,
+            condition: v0,
+            true_val: v2,
+            false_val: v1,
+        };
+        let (k3, _) = ValueKey::from_op(&sel3).unwrap();
+        assert_ne!(k1, k3);
+
+        // `Rcl` is impure (hidden carry dependence) -> never value-numbered.
+        let rcl: SsaOp<MockTarget> = SsaOp::Rcl {
+            dest: v2,
+            value: v0,
+            amount: v1,
+        };
+        assert!(ValueKey::from_op(&rcl).is_none());
+    }
+
+    /// `ComputeFlags` carries no opcode discriminator — it models the flags of
+    /// `bsf`/`bsr`/`popcnt`/`bt` alike — so its result is *not* a function of
+    /// its SSA inputs alone. Value-numbering it aliases the flags of two
+    /// different native instructions that happen to share operands.
+    #[test]
+    fn value_key_does_not_number_compute_flags() {
+        let v0 = SsaVarId::from_index(0);
+        let v1 = SsaVarId::from_index(1);
+        let v2 = SsaVarId::from_index(2);
+
+        // `bsf v0, v1` and `bt v0, v1` are indistinguishable at this level.
+        let bsf_flags: SsaOp<MockTarget> = SsaOp::ComputeFlags {
+            dest: v2,
+            inputs: vec![v0, v1],
+        };
+
+        assert!(
+            ValueKey::from_op(&bsf_flags).is_none(),
+            "ComputeFlags must never be value-numbered: it has no opcode \
+             discriminator, so distinct native flag computations collide"
+        );
+    }
+
+    /// `CallClobber` defines *fresh, undefined* values for caller-saved
+    /// registers. Two clobbers are never the same value, but the generic key
+    /// normalizes every `Def` operand to a sentinel — so all single-output
+    /// clobbers in a function would key identically and GVN would forward one
+    /// call's clobbered register to another's.
+    #[test]
+    fn value_key_does_not_number_call_clobber() {
+        let v0 = SsaVarId::from_index(0);
+
+        let clobber: SsaOp<MockTarget> = SsaOp::CallClobber { outputs: vec![v0] };
+
+        assert!(
+            ValueKey::from_op(&clobber).is_none(),
+            "CallClobber must never be value-numbered: it defines fresh \
+             undefined values, not a function of its inputs"
+        );
+    }
+
+    /// A phi is block-relative by definition: its value depends on the block it
+    /// heads, which the generic key does not encode.
+    #[test]
+    fn value_key_does_not_number_phi() {
+        let v0 = SsaVarId::from_index(0);
+        let v1 = SsaVarId::from_index(1);
+        let v2 = SsaVarId::from_index(2);
+
+        let phi: SsaOp<MockTarget> = SsaOp::Phi {
+            dest: v2,
+            operands: vec![(0, v0), (1, v1)],
+        };
+
+        assert!(
+            ValueKey::from_op(&phi).is_none(),
+            "Phi must never be value-numbered: the key omits the defining block"
+        );
     }
 
     /// End-to-end smoke test: identical Add expressions should collapse.

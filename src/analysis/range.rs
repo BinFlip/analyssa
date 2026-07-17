@@ -60,7 +60,7 @@
 //! All operations are O(1) for Interval ranges and O(k) for Union ranges where
 //! k is the number of intervals. Normalization after union operations is O(k log k).
 //!
-//! ```rust,no_run
+//! ```rust
 //! use analyssa::analysis::ValueRange;
 //!
 //! // Create ranges

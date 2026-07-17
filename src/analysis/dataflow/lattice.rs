@@ -60,8 +60,18 @@ use crate::bitset::BitSet;
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::analysis::dataflow::MeetSemiLattice;
+///
+/// #[derive(Clone, Debug, PartialEq)]
+/// enum ConstantLattice {
+///     /// No information yet.
+///     Top,
+///     /// Known to hold exactly this constant.
+///     Const(i32),
+///     /// Conflicting values on different paths.
+///     Bottom,
+/// }
 ///
 /// impl MeetSemiLattice for ConstantLattice {
 ///     fn meet(&self, other: &Self) -> Self {
@@ -71,7 +81,28 @@ use crate::bitset::BitSet;
 ///             _ => Self::Bottom,
 ///         }
 ///     }
+///
+///     fn is_bottom(&self) -> bool {
+///         matches!(self, Self::Bottom)
+///     }
 /// }
+///
+/// let top = ConstantLattice::Top;
+/// let one = ConstantLattice::Const(1);
+/// let two = ConstantLattice::Const(2);
+///
+/// // Top is the identity: meeting with it preserves information.
+/// assert_eq!(top.meet(&one), one);
+///
+/// // Idempotent and commutative.
+/// assert_eq!(one.meet(&one), one);
+/// assert_eq!(one.meet(&two), two.meet(&one));
+///
+/// // Conflicting constants collapse to Bottom, which absorbs further meets.
+/// let conflict = one.meet(&two);
+/// assert_eq!(conflict, ConstantLattice::Bottom);
+/// assert!(conflict.is_bottom());
+/// assert_eq!(conflict.meet(&one), ConstantLattice::Bottom);
 /// ```
 pub trait MeetSemiLattice: Clone + Debug + PartialEq {
     /// Computes the meet (greatest lower bound) of two lattice elements.
@@ -164,6 +195,83 @@ impl JoinSemiLattice for BitSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lattice traits are reachable from `analysis::dataflow` directly, like
+    /// every other trait the module's header advertises. They were previously
+    /// only reachable via the longer `dataflow::lattice::` path, so the
+    /// documented import did not compile. Importing through the short path here
+    /// keeps the re-export from silently disappearing again.
+    /// A two-point lattice, the smallest thing that can implement [`Lattice`].
+    ///
+    /// No type in the crate implements the full [`Lattice`] trait — `BitSet`
+    /// provides only the two halves — so this also serves as the proof that the
+    /// trait is implementable as declared.
+    #[derive(Clone, Debug, PartialEq)]
+    enum TwoPoint {
+        Top,
+        Bottom,
+    }
+
+    impl MeetSemiLattice for TwoPoint {
+        fn meet(&self, other: &Self) -> Self {
+            if *self == Self::Bottom || *other == Self::Bottom {
+                Self::Bottom
+            } else {
+                Self::Top
+            }
+        }
+
+        fn is_bottom(&self) -> bool {
+            *self == Self::Bottom
+        }
+    }
+
+    impl JoinSemiLattice for TwoPoint {
+        fn join(&self, other: &Self) -> Self {
+            if *self == Self::Top || *other == Self::Top {
+                Self::Top
+            } else {
+                Self::Bottom
+            }
+        }
+
+        fn is_top(&self) -> bool {
+            *self == Self::Top
+        }
+    }
+
+    impl Lattice for TwoPoint {
+        fn top() -> Self {
+            Self::Top
+        }
+
+        fn bottom() -> Self {
+            Self::Bottom
+        }
+    }
+
+    /// The lattice traits are reachable from `analysis::dataflow` directly, like
+    /// every other trait the module header advertises. They were previously only
+    /// reachable via the longer `dataflow::lattice::` path, so the documented
+    /// import did not compile. Naming them through the short path here stops the
+    /// re-export from silently disappearing again.
+    #[test]
+    fn lattice_traits_are_re_exported_from_dataflow() {
+        use crate::analysis::dataflow::{JoinSemiLattice, Lattice, MeetSemiLattice};
+
+        fn assert_meet<T: MeetSemiLattice>() {}
+        fn assert_join<T: JoinSemiLattice>() {}
+        fn assert_lattice<T: Lattice>() {}
+
+        assert_meet::<BitSet>();
+        assert_join::<BitSet>();
+        assert_lattice::<TwoPoint>();
+
+        // Absorption, the property `Lattice` documents but cannot enforce.
+        let (top, bottom) = (TwoPoint::top(), TwoPoint::bottom());
+        assert_eq!(top.meet(&top.join(&bottom)), top);
+        assert_eq!(top.join(&top.meet(&bottom)), top);
+    }
 
     #[test]
     fn test_bitset_meet_union() {

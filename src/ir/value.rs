@@ -38,7 +38,11 @@
 //! - **Join** (least upper bound): Used to find what is possibly true on
 //!   any incoming path
 
-use std::fmt;
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+    mem,
+};
 
 use crate::{ir::variable::SsaVarId, target::Endianness, target::Target, PointerSize};
 
@@ -50,7 +54,36 @@ use crate::{ir::variable::SsaVarId, target::Endianness, target::Target, PointerS
 ///
 /// Generic over `T: Target` so metadata handles (type refs, method refs, field refs)
 /// carry the host's reference types rather than generic placeholders.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// # Equality
+///
+/// [`PartialEq`]/[`Eq`]/[`Hash`] model **structural constant identity**: "are
+/// these the same constant?", not "would these compare equal at runtime?".
+/// Floating-point arms are therefore compared and hashed **bitwise**, which is
+/// what makes [`Eq`] sound (`NaN` is reflexive here) and lets constants be used
+/// as hash-map keys — global value numbering keys on exactly this.
+///
+/// Two consequences follow, both deliberate:
+///
+/// - `F64(NAN) == F64(NAN)` is `true` (identical bit patterns).
+/// - `F64(0.0) == F64(-0.0)` is `false` (distinct bit patterns, and
+///   distinguishable at runtime via `1.0 / x`).
+///
+/// IEEE-754 *semantic* comparison is a separate operation: use [`Self::ceq`]
+/// and the `c*_un` family, which implement CIL/IEEE ordering and unordered
+/// semantics.
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(bound(
+        serialize = "T::TypeRef: serde::Serialize, T::MethodRef: serde::Serialize, \
+                     T::FieldRef: serde::Serialize",
+        deserialize = "T::TypeRef: serde::Deserialize<'de>, \
+                       T::MethodRef: serde::Deserialize<'de>, \
+                       T::FieldRef: serde::Deserialize<'de>"
+    ))
+)]
 pub enum ConstValue<T: Target> {
     /// Signed 8-bit integer constant (CIL: `int8`).
     I8(i8),
@@ -134,8 +167,87 @@ pub enum ConstValue<T: Target> {
     DecryptedArray(Box<DecryptedArrayData<T>>),
 }
 
+impl<T: Target> PartialEq for ConstValue<T> {
+    /// Compares two constants for structural identity.
+    ///
+    /// Constants of different arms are never equal, even when they denote the
+    /// same mathematical value (`I32(4) != I64(4)`) — the arm is part of the
+    /// constant's identity. Floats compare bitwise; see the type-level
+    /// documentation for why.
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::I8(a), Self::I8(b)) => a == b,
+            (Self::I16(a), Self::I16(b)) => a == b,
+            (Self::I32(a), Self::I32(b)) => a == b,
+            (Self::I64(a), Self::I64(b)) => a == b,
+            (Self::U8(a), Self::U8(b)) => a == b,
+            (Self::U16(a), Self::U16(b)) => a == b,
+            (Self::U32(a), Self::U32(b)) => a == b,
+            (Self::U64(a), Self::U64(b)) => a == b,
+            (Self::NativeInt(a), Self::NativeInt(b)) => a == b,
+            (Self::NativeUInt(a), Self::NativeUInt(b)) => a == b,
+            // Bitwise, so `Eq` is reflexive for `NaN`.
+            (Self::F32(a), Self::F32(b)) => a.to_bits() == b.to_bits(),
+            (Self::F64(a), Self::F64(b)) => a.to_bits() == b.to_bits(),
+            (Self::Vector(a), Self::Vector(b)) => a == b,
+            (Self::String(a), Self::String(b)) => a == b,
+            (Self::DecryptedString(a), Self::DecryptedString(b)) => a == b,
+            (Self::Null, Self::Null) | (Self::True, Self::True) | (Self::False, Self::False) => {
+                true
+            }
+            (Self::Type(a), Self::Type(b)) => a == b,
+            (Self::MethodHandle(a), Self::MethodHandle(b)) => a == b,
+            (Self::FieldHandle(a), Self::FieldHandle(b)) => a == b,
+            (Self::DecryptedArray(a), Self::DecryptedArray(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// Structural identity is reflexive: the float arms compare bitwise, so
+/// `NaN == NaN` holds here even though IEEE-754 says otherwise.
+impl<T: Target> Eq for ConstValue<T> {}
+
+impl<T: Target> Hash for ConstValue<T> {
+    /// Hashes the constant consistently with [`PartialEq`]: the arm followed by
+    /// its payload, with floats hashed by their bit pattern.
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        mem::discriminant(self).hash(state);
+        match self {
+            Self::I8(v) => v.hash(state),
+            Self::I16(v) => v.hash(state),
+            Self::I32(v) => v.hash(state),
+            Self::I64(v) => v.hash(state),
+            Self::U8(v) => v.hash(state),
+            Self::U16(v) => v.hash(state),
+            Self::U32(v) => v.hash(state),
+            Self::U64(v) => v.hash(state),
+            Self::NativeInt(v) => v.hash(state),
+            Self::NativeUInt(v) => v.hash(state),
+            Self::F32(v) => v.to_bits().hash(state),
+            Self::F64(v) => v.to_bits().hash(state),
+            Self::Vector(v) => v.hash(state),
+            Self::String(v) => v.hash(state),
+            Self::DecryptedString(v) => v.hash(state),
+            Self::Null | Self::True | Self::False => {}
+            Self::Type(v) => v.hash(state),
+            Self::MethodHandle(v) => v.hash(state),
+            Self::FieldHandle(v) => v.hash(state),
+            Self::DecryptedArray(v) => v.hash(state),
+        }
+    }
+}
+
 /// Boxed payload for [`ConstValue::DecryptedArray`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(bound(
+        serialize = "T::TypeRef: serde::Serialize",
+        deserialize = "T::TypeRef: serde::Deserialize<'de>"
+    ))
+)]
 pub struct DecryptedArrayData<T: Target> {
     /// Raw bytes of the array data in little-endian element layout.
     pub data: Vec<u8>,
@@ -451,9 +563,36 @@ impl<T: Target> ConstValue<T> {
         }
     }
 
+    /// Folds a binary operation lane-wise over two equal-length vector
+    /// constants, returning `None` if the lane counts differ or any lane fails
+    /// to fold. This lifts every scalar fold method ([`Self::add`],
+    /// [`Self::mul`], …) to SIMD vector constants with no per-op code.
+    fn zip_lanes(a: &[Self], b: &[Self], f: impl Fn(&Self, &Self) -> Option<Self>) -> Option<Self> {
+        if a.len() != b.len() {
+            return None;
+        }
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| f(x, y))
+            .collect::<Option<Vec<_>>>()
+            .map(|lanes| Self::Vector(lanes.into_boxed_slice()))
+    }
+
+    /// Folds a unary operation lane-wise over a vector constant, returning
+    /// `None` if any lane fails to fold.
+    fn map_lanes(a: &[Self], f: impl Fn(&Self) -> Option<Self>) -> Option<Self> {
+        a.iter()
+            .map(f)
+            .collect::<Option<Vec<_>>>()
+            .map(|lanes| Self::Vector(lanes.into_boxed_slice()))
+    }
+
     /// Attempts to negate this constant.
     #[must_use]
     pub fn negate(&self, ptr_size: PointerSize) -> Option<Self> {
+        if let Self::Vector(a) = self {
+            return Self::map_lanes(a, |x| x.negate(ptr_size));
+        }
         match self {
             Self::I8(v) => Some(Self::I8(v.wrapping_neg())),
             Self::I16(v) => Some(Self::I16(v.wrapping_neg())),
@@ -476,6 +615,9 @@ impl<T: Target> ConstValue<T> {
     /// Attempts to perform bitwise NOT on this constant.
     #[must_use]
     pub fn bitwise_not(&self, ptr_size: PointerSize) -> Option<Self> {
+        if let Self::Vector(a) = self {
+            return Self::map_lanes(a, |x| x.bitwise_not(ptr_size));
+        }
         match self {
             Self::I8(v) => Some(Self::I8(!v)),
             Self::I16(v) => Some(Self::I16(!v)),
@@ -495,6 +637,9 @@ impl<T: Target> ConstValue<T> {
     /// Attempts to perform bitwise AND on two constants.
     #[must_use]
     pub fn bitwise_and(&self, other: &Self, ptr_size: PointerSize) -> Option<Self> {
+        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
+            return Self::zip_lanes(a, b, |x, y| x.bitwise_and(y, ptr_size));
+        }
         match (self, other) {
             (Self::I8(a), Self::I8(b)) => Some(Self::I8(a & b)),
             (Self::I16(a), Self::I16(b)) => Some(Self::I16(a & b)),
@@ -521,6 +666,9 @@ impl<T: Target> ConstValue<T> {
     /// Attempts to perform bitwise OR on two constants.
     #[must_use]
     pub fn bitwise_or(&self, other: &Self, ptr_size: PointerSize) -> Option<Self> {
+        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
+            return Self::zip_lanes(a, b, |x, y| x.bitwise_or(y, ptr_size));
+        }
         match (self, other) {
             (Self::I8(a), Self::I8(b)) => Some(Self::I8(a | b)),
             (Self::I16(a), Self::I16(b)) => Some(Self::I16(a | b)),
@@ -546,6 +694,9 @@ impl<T: Target> ConstValue<T> {
     /// Attempts to perform bitwise XOR on two constants.
     #[must_use]
     pub fn bitwise_xor(&self, other: &Self, ptr_size: PointerSize) -> Option<Self> {
+        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
+            return Self::zip_lanes(a, b, |x, y| x.bitwise_xor(y, ptr_size));
+        }
         match (self, other) {
             (Self::I8(a), Self::I8(b)) => Some(Self::I8(a ^ b)),
             (Self::I16(a), Self::I16(b)) => Some(Self::I16(a ^ b)),
@@ -572,6 +723,9 @@ impl<T: Target> ConstValue<T> {
     #[must_use]
     #[allow(clippy::cast_sign_loss)] // Shift amounts are non-negative by convention
     pub fn shl(&self, amount: &Self, ptr_size: PointerSize) -> Option<Self> {
+        if let (Self::Vector(a), Self::Vector(b)) = (self, amount) {
+            return Self::zip_lanes(a, b, |x, y| x.shl(y, ptr_size));
+        }
         let shift = amount.as_i32()? as u32;
         match self {
             Self::I8(v) => Some(Self::I8(v.wrapping_shl(shift))),
@@ -594,6 +748,9 @@ impl<T: Target> ConstValue<T> {
     #[allow(clippy::cast_sign_loss)] // Shift amounts and unsigned shifts use intentional casts
     #[allow(clippy::cast_possible_wrap)] // Wrapping is expected for logical shift operations
     pub fn shr(&self, amount: &Self, unsigned: bool, ptr_size: PointerSize) -> Option<Self> {
+        if let (Self::Vector(a), Self::Vector(b)) = (self, amount) {
+            return Self::zip_lanes(a, b, |x, y| x.shr(y, unsigned, ptr_size));
+        }
         let shift = amount.as_i32()? as u32;
         match self {
             Self::I8(v) => {
@@ -644,6 +801,9 @@ impl<T: Target> ConstValue<T> {
     /// Attempts to add two constants.
     #[must_use]
     pub fn add(&self, other: &Self, ptr_size: PointerSize) -> Option<Self> {
+        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
+            return Self::zip_lanes(a, b, |x, y| x.add(y, ptr_size));
+        }
         match (self, other) {
             (Self::I8(a), Self::I8(b)) => Some(Self::I8(a.wrapping_add(*b))),
             (Self::I16(a), Self::I16(b)) => Some(Self::I16(a.wrapping_add(*b))),
@@ -674,6 +834,9 @@ impl<T: Target> ConstValue<T> {
     /// Attempts to subtract two constants.
     #[must_use]
     pub fn sub(&self, other: &Self, ptr_size: PointerSize) -> Option<Self> {
+        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
+            return Self::zip_lanes(a, b, |x, y| x.sub(y, ptr_size));
+        }
         match (self, other) {
             (Self::I8(a), Self::I8(b)) => Some(Self::I8(a.wrapping_sub(*b))),
             (Self::I16(a), Self::I16(b)) => Some(Self::I16(a.wrapping_sub(*b))),
@@ -701,6 +864,9 @@ impl<T: Target> ConstValue<T> {
     /// Attempts to multiply two constants.
     #[must_use]
     pub fn mul(&self, other: &Self, ptr_size: PointerSize) -> Option<Self> {
+        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
+            return Self::zip_lanes(a, b, |x, y| x.mul(y, ptr_size));
+        }
         match (self, other) {
             (Self::I8(a), Self::I8(b)) => Some(Self::I8(a.wrapping_mul(*b))),
             (Self::I16(a), Self::I16(b)) => Some(Self::I16(a.wrapping_mul(*b))),
@@ -851,6 +1017,9 @@ impl<T: Target> ConstValue<T> {
     /// MIN/-1 overflows fold to `None` rather than wrapping silently.
     #[must_use]
     pub fn div(&self, other: &Self, ptr_size: PointerSize) -> Option<Self> {
+        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
+            return Self::zip_lanes(a, b, |x, y| x.div(y, ptr_size));
+        }
         match (self, other) {
             (Self::I8(a), Self::I8(b)) => a.checked_div(*b).map(Self::I8),
             (Self::I16(a), Self::I16(b)) => a.checked_div(*b).map(Self::I16),
@@ -874,6 +1043,9 @@ impl<T: Target> ConstValue<T> {
     /// `checked_rem` so MIN%-1 overflows fold to `None`.
     #[must_use]
     pub fn rem(&self, other: &Self, ptr_size: PointerSize) -> Option<Self> {
+        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
+            return Self::zip_lanes(a, b, |x, y| x.rem(y, ptr_size));
+        }
         match (self, other) {
             (Self::I8(a), Self::I8(b)) => a.checked_rem(*b).map(Self::I8),
             (Self::I16(a), Self::I16(b)) => a.checked_rem(*b).map(Self::I16),
@@ -897,6 +1069,9 @@ impl<T: Target> ConstValue<T> {
     #[allow(clippy::float_cmp)] // Exact comparison is correct for constant propagation
     #[allow(clippy::match_same_arms)] // NativeInt/NativeUInt are semantically different
     pub fn ceq(&self, other: &Self) -> Option<Self> {
+        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
+            return Self::zip_lanes(a, b, |x, y| x.ceq(y));
+        }
         match (self, other) {
             (Self::I8(a), Self::I8(b)) => Some(Self::from_bool(a == b)),
             (Self::I16(a), Self::I16(b)) => Some(Self::from_bool(a == b)),
@@ -929,6 +1104,9 @@ impl<T: Target> ConstValue<T> {
     #[must_use]
     #[allow(clippy::match_same_arms)] // NativeInt/NativeUInt are semantically different
     pub fn clt(&self, other: &Self) -> Option<Self> {
+        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
+            return Self::zip_lanes(a, b, |x, y| x.clt(y));
+        }
         match (self, other) {
             (Self::I8(a), Self::I8(b)) => Some(Self::from_bool(a < b)),
             (Self::I16(a), Self::I16(b)) => Some(Self::from_bool(a < b)),
@@ -984,6 +1162,9 @@ impl<T: Target> ConstValue<T> {
     #[must_use]
     #[allow(clippy::match_same_arms)] // NativeInt/NativeUInt are semantically different
     pub fn cgt(&self, other: &Self) -> Option<Self> {
+        if let (Self::Vector(a), Self::Vector(b)) = (self, other) {
+            return Self::zip_lanes(a, b, |x, y| x.cgt(y));
+        }
         match (self, other) {
             (Self::I8(a), Self::I8(b)) => Some(Self::from_bool(a > b)),
             (Self::I16(a), Self::I16(b)) => Some(Self::from_bool(a > b)),
@@ -1211,6 +1392,17 @@ where
 /// Generic over the host `Target` because the `Constant` variant carries a
 /// `ConstValue<T>`.
 #[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(bound(
+        serialize = "T::TypeRef: serde::Serialize, T::MethodRef: serde::Serialize, \
+                     T::FieldRef: serde::Serialize",
+        deserialize = "T::TypeRef: serde::Deserialize<'de>, \
+                       T::MethodRef: serde::Deserialize<'de>, \
+                       T::FieldRef: serde::Deserialize<'de>"
+    ))
+)]
 pub enum AbstractValue<T: Target> {
     /// No information yet (top of lattice).
     ///
@@ -1386,6 +1578,7 @@ where
 /// This represents the result of a computation, enabling recognition
 /// of equivalent expressions that can be eliminated.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ComputedValue {
     /// The operation that produced this value.
     pub op: ComputedOp,
@@ -1459,6 +1652,7 @@ impl fmt::Display for ComputedValue {
 /// These represent the pure operations whose results can be reused
 /// when the same operation is performed with the same operands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ComputedOp {
     // Arithmetic
     /// Addition
@@ -1590,6 +1784,44 @@ mod tests {
     type Cv = ConstValue<MockTarget>;
     type Av = AbstractValue<MockTarget>;
 
+    /// `ConstValue`'s `Eq`/`Hash` model structural constant identity, which is
+    /// what lets GVN use an op (and therefore its constants) as a hash-map key.
+    /// The float arms must compare bitwise or `Eq` would not be reflexive.
+    #[test]
+    fn const_value_equality_is_structural_and_reflexive_for_floats() {
+        use std::collections::hash_map::DefaultHasher;
+
+        fn hash_of(v: &Cv) -> u64 {
+            let mut h = DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        }
+
+        // Reflexive even for NaN — required for `Eq` to be sound.
+        assert_eq!(Cv::F64(f64::NAN), Cv::F64(f64::NAN));
+        assert_eq!(Cv::F32(f32::NAN), Cv::F32(f32::NAN));
+        assert_eq!(hash_of(&Cv::F64(f64::NAN)), hash_of(&Cv::F64(f64::NAN)));
+
+        // `+0.0` and `-0.0` are distinct constants: they are distinguishable at
+        // runtime (`1.0 / x`), so value numbering must not conflate them.
+        assert_ne!(Cv::F64(0.0), Cv::F64(-0.0));
+
+        // Equal values hash equally (the `Hash`/`Eq` contract).
+        assert_eq!(Cv::F64(1.5), Cv::F64(1.5));
+        assert_eq!(hash_of(&Cv::F64(1.5)), hash_of(&Cv::F64(1.5)));
+
+        // The arm is part of the identity: same number, different type.
+        assert_ne!(Cv::I32(4), Cv::I64(4));
+
+        // IEEE semantic comparison is a separate operation and is unaffected:
+        // `ceq` still reports NaN as not-equal.
+        assert_eq!(
+            Cv::F64(f64::NAN).ceq(&Cv::F64(f64::NAN)),
+            Some(Cv::False),
+            "ceq keeps IEEE semantics; only structural equality is bitwise"
+        );
+    }
+
     #[test]
     fn const_value_classifies_and_extracts_scalars() {
         assert!(Cv::Null.is_null());
@@ -1657,6 +1889,42 @@ mod tests {
         assert_eq!(Cv::I8(-8).shr(&Cv::I32(1), false, ptr), Some(Cv::I8(-4)));
         assert_eq!(Cv::I8(-8).shr(&Cv::I32(1), true, ptr), Some(Cv::I8(124)));
         assert_eq!(Cv::I32(1).add(&Cv::F32(1.0), ptr), None);
+    }
+
+    #[test]
+    fn vector_constants_fold_lane_wise() {
+        let ptr = PointerSize::Bit64;
+        let vec = |xs: &[i32]| {
+            Cv::Vector(
+                xs.iter()
+                    .map(|&x| Cv::I32(x))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            )
+        };
+
+        // Binary ops fold element-by-element.
+        assert_eq!(
+            vec(&[1, 2, 3]).add(&vec(&[10, 20, 30]), ptr),
+            Some(vec(&[11, 22, 33]))
+        );
+        assert_eq!(
+            vec(&[0b1010, 0b1100]).bitwise_and(&vec(&[0b1100, 0b1010]), ptr),
+            Some(vec(&[0b1000, 0b1000]))
+        );
+        // Unary ops fold element-by-element.
+        assert_eq!(vec(&[1, -2, 3]).negate(ptr), Some(vec(&[-1, 2, -3])));
+
+        // Comparisons produce a per-lane boolean mask.
+        assert_eq!(
+            vec(&[1, 5]).clt(&vec(&[2, 4])),
+            Some(Cv::Vector(vec![Cv::True, Cv::False].into_boxed_slice()))
+        );
+
+        // Mismatched lane counts and any unfoldable lane abort the whole fold.
+        assert_eq!(vec(&[1, 2]).add(&vec(&[1]), ptr), None);
+        let mixed = Cv::Vector(vec![Cv::I32(1), Cv::F32(2.0)].into_boxed_slice());
+        assert_eq!(mixed.add(&vec(&[1, 2]), ptr), None);
     }
 
     #[test]

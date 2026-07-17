@@ -61,6 +61,7 @@ use crate::ir::variable::{SsaVarId, VariableOrigin};
 /// assert_eq!(operand.predecessor(), 1);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PhiOperand {
     /// The SSA variable providing the value.
     value: SsaVarId,
@@ -139,6 +140,7 @@ impl fmt::Display for PhiOperand {
 /// assert_eq!(phi.operand_count(), 2);
 /// ```
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PhiNode {
     /// The SSA variable that this phi node defines (its result).
     /// This is the variable that subsequent instructions in this block

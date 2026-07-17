@@ -182,7 +182,16 @@ where
     let rpo = compute_reverse_postorder(ssa, &reachable, &cfg);
     let live = compute_live_variables(ssa, &reachable, &rpo);
 
-    // Step 9: remove dead phis.
+    // Steps 9+10: dead phis and dead pure definitions.
+    //
+    // Both sets are derived from `live`, which — like `dead_phi_results` — is a
+    // `BitSet` indexed by `SsaVarId`. Closing an edit session runs the boundary
+    // repair (`repair_ssa` -> `compact_variables`), which **renumbers every
+    // `SsaVarId`**, so no var-id-keyed analysis result survives a session
+    // boundary. Both removals therefore share ONE session, applied only after
+    // every such result has been consumed: removing the phis in their own session
+    // and *then* consulting `live` for dead definitions would index the old
+    // numbering with new ids and delete definitions that are still live.
     let dead_phis = find_dead_phis(ssa, &reachable, &live);
     let mut dead_phi_results = BitSet::new(ssa.var_id_capacity());
     for &(block_idx, phi_idx) in &dead_phis {
@@ -194,14 +203,11 @@ where
             dead_phi_results.insert(result.index());
         }
     }
-    remove_phis(ssa, &dead_phis, method, events);
-    total_changes = total_changes.saturating_add(dead_phis.len());
-
-    // Step 10: dead pure definitions.
     let dead_defs = find_dead_definitions(ssa, &reachable, &live, &dead_phi_results);
-    let c10 = dead_defs.len();
-    remove_instructions(ssa, &dead_defs, method, events);
-    total_changes = total_changes.saturating_add(c10);
+    total_changes = total_changes
+        .saturating_add(dead_phis.len())
+        .saturating_add(dead_defs.len());
+    remove_dead_phis_and_definitions(ssa, &dead_phis, &dead_defs, method, events);
 
     total_changes
 }
@@ -512,8 +518,21 @@ fn find_dead_phis<T: Target>(
     dead
 }
 
-fn remove_instructions<T, L>(
+/// Removes dead phi nodes and dead pure definitions in a **single** edit session.
+///
+/// Both sets are computed from one liveness snapshot before any mutation. They
+/// must also be *applied* together: an edit session's boundary repair renumbers
+/// every [`SsaVarId`] (`repair_ssa` -> `compact_variables`), so splitting the two
+/// removals across two sessions would leave the caller's var-id-keyed liveness
+/// bitset describing the pre-renumber function while the ids it is queried with
+/// come from the post-renumber one — silently deleting live definitions.
+///
+/// Phi indices and instruction indices live in separate per-block vectors, so the
+/// two removals cannot disturb each other's indices; each is applied
+/// highest-index-first so earlier removals do not shift later ones.
+fn remove_dead_phis_and_definitions<T, L>(
     ssa: &mut SsaFunction<T>,
+    dead_phis: &[(usize, usize)],
     dead_defs: &[(usize, usize)],
     method: &T::MethodRef,
     events: &L,
@@ -521,13 +540,20 @@ fn remove_instructions<T, L>(
     T: Target,
     L: EventListener<T> + ?Sized,
 {
-    let mut by_block: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    let mut instructions_by_block: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for &(block_idx, instr_idx) in dead_defs {
-        by_block.entry(block_idx).or_default().push(instr_idx);
+        instructions_by_block
+            .entry(block_idx)
+            .or_default()
+            .push(instr_idx);
+    }
+    let mut phis_by_block: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for &(block_idx, phi_idx) in dead_phis {
+        phis_by_block.entry(block_idx).or_default().push(phi_idx);
     }
 
     let _ = ssa.edit(SsaEditOptions::new(), |editor| {
-        for (block_idx, mut indices) in by_block {
+        for (block_idx, mut indices) in instructions_by_block {
             indices.sort_by(|a, b| b.cmp(a));
             for instr_idx in indices {
                 let Some(instr) = editor
@@ -556,26 +582,7 @@ fn remove_instructions<T, L>(
                 );
             }
         }
-        Ok(())
-    });
-}
-
-fn remove_phis<T, L>(
-    ssa: &mut SsaFunction<T>,
-    dead_phis: &[(usize, usize)],
-    method: &T::MethodRef,
-    events: &L,
-) where
-    T: Target,
-    L: EventListener<T> + ?Sized,
-{
-    let mut by_block: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for &(block_idx, phi_idx) in dead_phis {
-        by_block.entry(block_idx).or_default().push(phi_idx);
-    }
-
-    let _ = ssa.edit(SsaEditOptions::new(), |editor| {
-        for (block_idx, mut indices) in by_block {
+        for (block_idx, mut indices) in phis_by_block {
             indices.sort_by(|a, b| b.cmp(a));
             for phi_idx in indices {
                 if editor.remove_phi(block_idx, phi_idx).is_ok() {
@@ -1358,5 +1365,164 @@ mod tests {
         assert!(changed);
         // v1 should be gone after compaction
         assert!(log.has(EventKind::InstructionRemoved));
+    }
+
+    /// Regression: DCE must never delete a live definition, however the variables
+    /// happen to be numbered.
+    ///
+    /// Liveness is a `BitSet` keyed by `SsaVarId`, and closing an edit session
+    /// renumbers every `SsaVarId` (`repair_ssa` -> `compact_variables`). Applying
+    /// the dead-phi removal in its own session and *then* consulting that bitset
+    /// for dead definitions reads the **old** numbering with **new** ids, deleting
+    /// definitions that are still live. Whether a given function trips the
+    /// mismatch depends entirely on how its ids permute under compaction, so this
+    /// sweeps the id space rather than asserting one hand-built collision.
+    ///
+    /// `VerifyLevel::Quick` has no defined-before-use check, so in a release build
+    /// the resulting corruption was silently *accepted* rather than rolled back —
+    /// hence the check here is `Full`.
+    #[test]
+    fn dce_never_deletes_a_live_definition() {
+        // Deterministic xorshift; no `rand` dependency, and a failure is
+        // reproducible from the printed seed.
+        fn next(state: &mut u64) -> u64 {
+            let mut x = *state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *state = x;
+            x
+        }
+
+        for seed in 1..2_000u64 {
+            let mut rng = seed;
+            // `slots` constants, all defined in the entry block so each dominates
+            // the join, plus the phi result. Ids are permuted across ALL of them —
+            // including the phi's — because the corruption needs the dead phi to
+            // hold a *low* id: compaction only shifts the ids above the one it
+            // drops, so a phi pinned to the highest id renumbers nothing.
+            let slots = 4 + (next(&mut rng) % 4) as usize; // 4..=7
+            let total = slots + 1;
+            let mut perm: Vec<usize> = (0..total).collect();
+            for i in (1..total).rev() {
+                let j = (next(&mut rng) % (i as u64 + 1)) as usize;
+                perm.swap(i, j);
+            }
+            let ids = &perm[..slots]; // const ids, by slot
+            let phi_id = perm[slots]; // the dead phi's id
+
+            // Variables must be created in id order, so invert the permutation:
+            // `owner[id]` is the slot that owns `id`, or `None` for the phi.
+            let mut owner: Vec<Option<usize>> = vec![None; total];
+            for (slot, &id) in ids.iter().enumerate() {
+                owner[id] = Some(slot);
+            }
+
+            let mut ssa: SsaFunction<MockTarget> = SsaFunction::new(0, total);
+            for (id, slot) in owner.iter().enumerate() {
+                match slot {
+                    Some(slot) => ssa.create_variable(
+                        VariableOrigin::Local(id as u16),
+                        0,
+                        DefSite::instruction(0, *slot),
+                        MockType::I32,
+                    ),
+                    None => ssa.create_variable(
+                        VariableOrigin::Local(id as u16),
+                        3,
+                        DefSite::phi(3),
+                        MockType::I32,
+                    ),
+                };
+            }
+            let var = |slot: usize| SsaVarId::from_index(ids[slot]);
+
+            let mut b0 = SsaBlock::new(0);
+            for slot in 0..slots {
+                b0.add_instruction(SsaInstruction::synthetic(SsaOp::Const {
+                    dest: var(slot),
+                    value: ConstValue::I32(slot as i32),
+                }));
+            }
+            b0.add_instruction(SsaInstruction::synthetic(SsaOp::Branch {
+                condition: var(0),
+                true_target: 1,
+                false_target: 2,
+            }));
+            ssa.add_block(b0);
+
+            let mut b1 = SsaBlock::new(1);
+            b1.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 3 }));
+            ssa.add_block(b1);
+
+            let mut b2 = SsaBlock::new(2);
+            b2.add_instruction(SsaInstruction::synthetic(SsaOp::Jump { target: 3 }));
+            ssa.add_block(b2);
+
+            // A two-operand phi (a one-operand phi is trivial and gets simplified
+            // away before the dead-phi step, so the renumbering never happens).
+            // Its result is unused -> dead.
+            let mut b3 = SsaBlock::new(3);
+            let left = (next(&mut rng) % slots as u64) as usize;
+            let mut right = (next(&mut rng) % slots as u64) as usize;
+            if right == left {
+                right = (left + 1) % slots;
+            }
+            let mut phi = PhiNode::new(
+                SsaVarId::from_index(phi_id),
+                VariableOrigin::Local(phi_id as u16),
+            );
+            phi.add_operand(PhiOperand::new(var(left), 1));
+            phi.add_operand(PhiOperand::new(var(right), 2));
+            b3.add_phi(phi);
+            // Return one of the entry constants: that one is unambiguously LIVE,
+            // and every other constant is dead.
+            let returned_slot = (next(&mut rng) % slots as u64) as usize;
+            b3.add_instruction(SsaInstruction::synthetic(SsaOp::Return {
+                value: Some(var(returned_slot)),
+            }));
+            ssa.add_block(b3);
+            ssa.recompute_uses();
+
+            let log: EventLog<MockTarget> = EventLog::new();
+            let method = 0u32;
+            let _ = run(&mut ssa, &method, &log, 20);
+
+            assert_mock_valid_full(&ssa, &format!("DCE corrupted SSA (seed {seed})"));
+
+            // Validity alone is NOT enough to catch this. When the stale lookup
+            // deletes the live definition, `compact_variables` drops the
+            // now-undefined variable and `remap_var_ids_in_blocks` silently
+            // *aliases* the dangling id onto whichever variable inherits that
+            // number (`remap.get(&id).unwrap_or(id)`). The result verifies
+            // cleanly and simply returns the WRONG constant. So assert the
+            // semantics: the returned value must still be defined by the very
+            // constant the function was built to return.
+            let returned = ssa
+                .blocks()
+                .iter()
+                .flat_map(SsaBlock::instructions)
+                .find_map(|instr| match instr.op() {
+                    SsaOp::Return { value } => *value,
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("function still returns a value (seed {seed})"));
+            let defining_value = ssa
+                .blocks()
+                .iter()
+                .flat_map(SsaBlock::instructions)
+                .find_map(|instr| match instr.op() {
+                    SsaOp::Const { dest, value } if *dest == returned => Some(value.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    panic!("DCE deleted the live returned definition (seed {seed})")
+                });
+            assert_eq!(
+                defining_value,
+                ConstValue::I32(returned_slot as i32),
+                "DCE left the function returning the wrong constant (seed {seed})"
+            );
+        }
     }
 }

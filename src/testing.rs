@@ -16,8 +16,8 @@ use crate::{
         function::{SsaDefSpec, SsaFunction, SsaFunctionBuilder, VectorFaultingLoadSpec},
         ops::{
             AtomicAccessWidth, AtomicOrdering, FenceKind, NativeClobber, SsaEffectKind, SsaEffects,
-            SsaOp, VectorBinaryKind, VectorCompareKind, VectorFaultMode, VectorMaskMode,
-            VectorSegmentLayout,
+            SsaOp, VectorBinaryKind, VectorCompareKind, VectorElement, VectorElementKind,
+            VectorFaultMode, VectorMaskMode, VectorSegmentLayout,
         },
         value::ConstValue,
         variable::{DefSite, SsaVarId, VariableOrigin},
@@ -52,11 +52,13 @@ fn fixture_option<T>(value: Option<T>, message: &str) -> T {
 /// A minimal [`Target`] impl for IR-core unit tests, doctests, and downstream
 /// integration tests. Has no dependency on any host metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MockTarget;
 
 /// Tiny stand-in type used to verify the IR core can carry an opaque
 /// `T::Type` without depending on a host's type system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum MockType {
     /// Unknown or intentionally unspecified type.
     Unknown,
@@ -540,7 +542,17 @@ pub fn vector_simd_fixture() -> SsaFunction<MockTarget> {
         let scalar = block.const_i32(mock_i32(), 9)?;
         let vector = block.vector_splat(mock_v4i32(), scalar, MockType::V4I32)?;
         let loaded = block.vector_load(mock_v4i32(), addr, MockType::V4I32)?;
-        let added = block.vector_binary(mock_v4i32(), vector, loaded, VectorBinaryKind::Add)?;
+        let added = block.vector_binary(
+            mock_v4i32(),
+            vector,
+            loaded,
+            VectorBinaryKind::Add,
+            VectorElement {
+                kind: VectorElementKind::Integer,
+                bits: 32,
+                scalar: false,
+            },
+        )?;
         let mask =
             block.vector_compare(mock_mask4(), added, loaded, VectorCompareKind::Eq, false)?;
         let (_faulting, fault) = block.vector_faulting_load(VectorFaultingLoadSpec {

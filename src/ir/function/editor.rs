@@ -505,7 +505,7 @@ impl<'a, T: Target> SsaEditor<'a, T> {
             )));
         };
 
-        instr.set_op(new_op);
+        instr.set_op_preserving_type(new_op);
         for dest in defs {
             if let Some(var) = self.ssa.variable_mut(dest) {
                 var.set_def_site(DefSite::instruction(block_idx, instr_idx));

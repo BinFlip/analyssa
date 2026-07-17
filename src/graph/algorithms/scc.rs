@@ -65,7 +65,7 @@ use crate::graph::{NodeId, Successors};
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId, algorithms::strongly_connected_components};
 ///
 /// // Simple cycle: A -> B -> C -> A
@@ -85,7 +85,7 @@ use crate::graph::{NodeId, Successors};
 ///
 /// # Acyclic Graph Example
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId, algorithms::strongly_connected_components};
 ///
 /// // DAG: A -> B -> C
@@ -260,7 +260,7 @@ impl TarjanState {
 ///
 /// # Examples
 ///
-/// ```rust,ignore
+/// ```rust
 /// use analyssa::graph::{DirectedGraph, NodeId, algorithms::{strongly_connected_components, condensation}};
 ///
 /// let mut graph: DirectedGraph<char, ()> = DirectedGraph::new();

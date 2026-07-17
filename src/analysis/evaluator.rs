@@ -86,31 +86,45 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
-//! use analyssa::{analysis::{SsaEvaluator, SymbolicExpr}, PointerSize};
+//! ```rust
+//! use analyssa::{
+//!     analysis::SsaEvaluator,
+//!     ir::{value::ConstValue, SsaVarId},
+//!     testing, PointerSize,
+//! };
 //!
+//! // Diamond CFG: block 0 computes `v0 = true` and branches on it.
+//! let ssa = testing::diamond_phi_fixture();
 //! let mut eval = SsaEvaluator::new(&ssa, PointerSize::Bit64);
 //!
-//! // Set known concrete values
-//! eval.set_concrete(state_var, initial_state);
-//!
-//! // Or mark as symbolic
-//! eval.set_symbolic(arg_var, "arg0");
-//!
 //! // Evaluate a block's instructions
-//! eval.evaluate_block(block_idx);
+//! eval.evaluate_block(0);
 //!
 //! // Get computed result
-//! match eval.get(result_var) {
-//!     Some(expr) if expr.is_constant() => println!("Known: {}", expr.as_constant().unwrap()),
-//!     Some(expr) => println!("Symbolic: {}", expr),
-//!     None => println!("Cannot determine"),
-//! }
+//! let condition = SsaVarId::from_index(0);
+//! let expr = eval.get(condition).unwrap();
+//! assert!(expr.is_constant());
+//! assert_eq!(expr.as_constant(), Some(&ConstValue::True));
 //!
-//! // Or use convenience method for concrete values
-//! if let Some(next_state) = eval.get_concrete(result_var) {
-//!     println!("Next state: {}", next_state);
-//! }
+//! // Or use the convenience method for concrete values
+//! assert_eq!(eval.get_concrete(condition), Some(&ConstValue::True));
+//!
+//! // Set known concrete values, or mark a variable as symbolic
+//! let ssa = testing::loop_counter_fixture();
+//! let mut eval = SsaEvaluator::new(&ssa, PointerSize::Bit64);
+//! let counter = SsaVarId::from_index(1);
+//! let limit = SsaVarId::from_index(4);
+//!
+//! eval.set_symbolic(counter, "arg0");
+//! let expr = eval.get(counter).unwrap();
+//! assert!(!expr.is_constant());
+//! assert_eq!(expr.to_string(), "arg0");
+//!
+//! eval.set_concrete(limit, ConstValue::I32(42));
+//! assert_eq!(eval.get_concrete(limit), Some(&ConstValue::I32(42)));
+//!
+//! // Variables with no assigned or computed value cannot be determined.
+//! assert!(eval.get(SsaVarId::from_index(5)).is_none());
 //! ```
 
 use std::collections::BTreeMap;
@@ -1187,6 +1201,38 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
         }
     }
 
+    /// Evaluates a scalar conversion (int↔int, int↔ptr, int↔float, float width),
+    /// shared by every conversion op. A concrete integer folds through the host's
+    /// [`Target::evaluate_int_conv`]; a symbolic operand passes through unchanged
+    /// (a conversion does not change symbolic structure).
+    fn evaluate_scalar_conversion(
+        &mut self,
+        dest: SsaVarId,
+        operand: SsaVarId,
+        target: &T::Type,
+        unsigned: bool,
+    ) -> Option<SymbolicExpr<T>> {
+        let value = self.values.get(&operand).cloned();
+        if let Some(expr) = value {
+            if let Some(v) = expr.as_i64() {
+                let ptr_bytes = self.pointer_size.bytes() as u32;
+                let converted = T::evaluate_int_conv(v, target, unsigned, ptr_bytes)
+                    .unwrap_or(ConstValue::I64(v));
+                let result = SymbolicExpr::constant(converted);
+                self.values.insert(dest, result.clone());
+                self.track_origin_state(dest, &result);
+                Some(result)
+            } else {
+                self.values.insert(dest, expr.clone());
+                self.track_origin_state(dest, &expr);
+                Some(expr)
+            }
+        } else {
+            self.values.remove(&dest);
+            None
+        }
+    }
+
     /// Evaluates a single SSA operation, updating tracked values.
     ///
     /// Returns the computed expression for operations that produce a result,
@@ -1601,38 +1647,43 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
                 self.eval_binary_op(*dest, *left, *right, op)
             }
 
-            SsaOp::Conv {
+            // Conversions carrying an integer-signedness (int↔int, int↔float).
+            SsaOp::IntConv {
                 dest,
                 operand,
                 target,
                 unsigned,
                 ..
-            } => {
-                let value = self.values.get(operand).cloned();
-                if let Some(expr) = value {
-                    if let Some(v) = expr.as_i64() {
-                        // Route apply_conversion through Target so the SsaType
-                        // pattern-matching stays in the host. Defaults to
-                        // wrapping the raw i64 (sufficient for hosts without
-                        // CIL-specific integer-to-typed-constant conversion).
-                        let ptr_bytes = self.pointer_size.bytes() as u32;
-                        let converted = T::evaluate_int_conv(v, target, *unsigned, ptr_bytes)
-                            .unwrap_or(ConstValue::I64(v));
-                        let result = SymbolicExpr::constant(converted);
-                        self.values.insert(*dest, result.clone());
-                        self.track_origin_state(*dest, &result);
-                        Some(result)
-                    } else {
-                        // Symbolic/Unknown pass through (conversions don't change symbolic structure)
-                        self.values.insert(*dest, expr.clone());
-                        self.track_origin_state(*dest, &expr);
-                        Some(expr)
-                    }
-                } else {
-                    self.values.remove(dest);
-                    None
-                }
             }
+            | SsaOp::IntToFloat {
+                dest,
+                operand,
+                target,
+                unsigned,
+            }
+            | SsaOp::FloatToInt {
+                dest,
+                operand,
+                target,
+                unsigned,
+                ..
+            } => self.evaluate_scalar_conversion(*dest, *operand, target, *unsigned),
+            // Conversions with no integer-signedness (pointer, float-width).
+            SsaOp::IntToPtr {
+                dest,
+                operand,
+                target,
+            }
+            | SsaOp::PtrToInt {
+                dest,
+                operand,
+                target,
+            }
+            | SsaOp::FloatConv {
+                dest,
+                operand,
+                target,
+            } => self.evaluate_scalar_conversion(*dest, *operand, target, false),
 
             // Operations with Option<SsaVarId> dest that produce unknown results
             SsaOp::Call { dest, .. }
@@ -1744,6 +1795,7 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
             | SsaOp::LoadToken { dest, .. }
             | SsaOp::SizeOf { dest, .. }
             | SsaOp::Ckfinite { dest, .. }
+            | SsaOp::FpClassify { dest, .. }
             | SsaOp::LocalAlloc { dest, .. }
             | SsaOp::LoadFunctionPtr { dest, .. }
             | SsaOp::LoadVirtFunctionPtr { dest, .. }
@@ -1916,16 +1968,27 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// use analyssa::{
+    ///     analysis::{ControlFlow, SsaEvaluator},
+    ///     testing, PointerSize,
+    /// };
+    ///
+    /// // Block 0 branches on a constant `true` to block 1; block 3 returns.
+    /// let ssa = testing::diamond_phi_fixture();
     /// let mut eval = SsaEvaluator::new(&ssa, PointerSize::Bit64);
-    /// eval.set_concrete(state_var, initial_state);
     /// eval.evaluate_block(0);
     ///
-    /// match eval.next_block(0) {
-    ///     ControlFlow::Continue(next) => { /* continue to next */ }
-    ///     ControlFlow::Terminal => { /* execution ends */ }
-    ///     ControlFlow::Unknown => { /* cannot determine */ }
-    /// }
+    /// // The condition folds to a constant, so the taken edge is known.
+    /// assert_eq!(eval.next_block(0), ControlFlow::Continue(1));
+    ///
+    /// // The merge block ends in a return, so it has no successor.
+    /// assert_eq!(eval.next_block(3), ControlFlow::Terminal);
+    ///
+    /// // A block that was never evaluated has an undetermined condition.
+    /// let ssa = testing::loop_counter_fixture();
+    /// let eval = SsaEvaluator::new(&ssa, PointerSize::Bit64);
+    /// assert_eq!(eval.next_block(1), ControlFlow::Unknown);
     /// ```
     #[must_use]
     pub fn next_block(&self, block_idx: usize) -> ControlFlow {
@@ -2098,14 +2161,29 @@ impl<'a, T: Target> SsaEvaluator<'a, T> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust
+    /// use analyssa::{
+    ///     analysis::SsaEvaluator,
+    ///     ir::{value::ConstValue, SsaVarId},
+    ///     testing, PointerSize,
+    /// };
+    ///
+    /// // A loop that increments a counter until it reaches 4.
+    /// let ssa = testing::loop_counter_fixture();
     /// let mut eval = SsaEvaluator::new(&ssa, PointerSize::Bit64);
-    /// eval.set_concrete(state_var, initial_state);
+    ///
+    /// let state_var = SsaVarId::from_index(1);
+    /// eval.set_concrete(state_var, ConstValue::I32(0));
     ///
     /// let trace = eval.execute(0, Some(state_var), 1000);
-    /// for (block, state) in trace.blocks().iter().zip(trace.states()) {
-    ///     println!("Block {}: state = {:?}", block, state);
-    /// }
+    ///
+    /// // Execution enters the loop header, revisits it until the counter
+    /// // reaches the limit, then falls through to the exit block.
+    /// assert_eq!(trace.blocks(), &[0, 1, 1, 1, 1, 2]);
+    ///
+    /// // The captured state values follow the counter as it increments.
+    /// assert_eq!(trace.states().last(), Some(&Some(ConstValue::I32(3))));
+    /// assert_eq!(trace.blocks().len(), trace.states().len());
     /// ```
     pub fn execute(
         &mut self,

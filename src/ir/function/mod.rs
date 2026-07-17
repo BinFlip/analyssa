@@ -89,6 +89,41 @@ use crate::{
     target::Target,
 };
 
+/// Serializes a `BTreeMap` as a sequence of `(key, value)` pairs.
+///
+/// [`VariableOrigin`] is an enum, and several data formats — JSON among them —
+/// only accept string map keys, so deriving would produce a type that compiles
+/// but fails at runtime with "key must be a string". Encoding as a pair sequence
+/// keeps [`SsaFunction`] serializable in *every* format rather than only the
+/// self-describing ones with non-string key support.
+#[cfg(feature = "serde")]
+mod map_as_pairs {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    /// Writes the map as a sequence of `(key, value)` pairs.
+    pub fn serialize<K, V, S>(map: &BTreeMap<K, V>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        K: Serialize,
+        V: Serialize,
+        S: Serializer,
+    {
+        serializer.collect_seq(map.iter())
+    }
+
+    /// Rebuilds the map from a sequence of `(key, value)` pairs.
+    pub fn deserialize<'de, K, V, D>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
+    where
+        K: Deserialize<'de> + Ord,
+        V: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        let pairs = Vec::<(K, V)>::deserialize(deserializer)?;
+        Ok(pairs.into_iter().collect())
+    }
+}
+
 /// A complete method in SSA (Static Single Assignment) form.
 ///
 /// The top-level container holding all SSA state for a single method:
@@ -110,6 +145,22 @@ use crate::{
 /// }
 /// ```
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(bound(
+        serialize = "T::Type: serde::Serialize, T::TypeRef: serde::Serialize, \
+                     T::MethodRef: serde::Serialize, T::FieldRef: serde::Serialize, \
+                     T::SigRef: serde::Serialize, T::OriginalInstruction: serde::Serialize, \
+                     T::ExceptionKind: serde::Serialize, T::LocalSignature: serde::Serialize",
+        deserialize = "T::Type: serde::Deserialize<'de>, T::TypeRef: serde::Deserialize<'de>, \
+                       T::MethodRef: serde::Deserialize<'de>, T::FieldRef: serde::Deserialize<'de>, \
+                       T::SigRef: serde::Deserialize<'de>, \
+                       T::OriginalInstruction: serde::Deserialize<'de>, \
+                       T::ExceptionKind: serde::Deserialize<'de>, \
+                       T::LocalSignature: serde::Deserialize<'de>"
+    ))
+)]
 pub struct SsaFunction<T: Target> {
     /// Basic blocks, indexed by block ID (0..block_count()-1).
     /// Maintained as a dense vector; blocks can be removed by `canonicalize`.
@@ -130,6 +181,7 @@ pub struct SsaFunction<T: Target> {
     /// Enables O(1) lookup of all versions of a given origin (e.g., all
     /// SSA versions of `Local(3)`). Populated by `create_variable()` and
     /// rebuilt by `rebuild_origin_versions()` after compaction.
+    #[cfg_attr(feature = "serde", serde(with = "map_as_pairs"))]
     origin_versions: BTreeMap<VariableOrigin, Vec<SsaVarId>>,
 
     /// Maps each variable origin to its canonical type.
@@ -137,6 +189,7 @@ pub struct SsaFunction<T: Target> {
     /// Populated during SSA construction from method signatures and type
     /// inference. Used by [`create_variable_for_origin()`](Self::create_variable_for_origin)
     /// so new versions inherit the correct type. First registration wins.
+    #[cfg_attr(feature = "serde", serde(with = "map_as_pairs"))]
     origin_types: BTreeMap<VariableOrigin, T::Type>,
 
     /// Number of method arguments (including `this` for instance methods).
@@ -772,10 +825,12 @@ impl<T: Target> SsaFunction<T> {
                     *operand = PhiOperand::new(resolve(old_value), operand.predecessor());
                 }
             }
-            // Remap instructions using existing remap_variables
+            // Remap instructions using existing remap_variables. The op shape is
+            // unchanged (only variable ids are rewritten), so the resolved
+            // result type is preserved rather than cleared.
             for instr in block.instructions_mut() {
                 let new_op = instr.op().remap_variables(lookup);
-                instr.set_op(new_op);
+                instr.set_op_preserving_type(new_op);
             }
         }
         // Remap preserved_dispatch_vars
@@ -1081,13 +1136,23 @@ impl<T: Target> SsaFunction<T> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// let ssa = build_ssa_from_method(&method)?;
-    /// ssa.validate()?; // Returns error if SSA is malformed
+    /// ```rust
+    /// use analyssa::{ir::SsaOp, testing};
     ///
-    /// // After running a pass
-    /// some_pass.run(&mut ssa);
-    /// ssa.validate()?; // Check the pass didn't break SSA invariants
+    /// let mut ssa = testing::const_i32_return(42);
+    ///
+    /// // A well-formed SSA function validates cleanly.
+    /// assert!(ssa.validate().is_ok());
+    /// assert!(ssa.is_valid());
+    ///
+    /// // Breaking an invariant (here: a terminator that returns an undefined
+    /// // variable) is reported instead of silently accepted.
+    /// let bogus = analyssa::ir::SsaVarId::from_index(999);
+    /// ssa.block_mut(0).unwrap().instructions_mut()[1]
+    ///     .set_op(SsaOp::Return { value: Some(bogus) });
+    ///
+    /// let errors = ssa.validate().unwrap_err();
+    /// assert!(!errors.is_empty());
     /// ```
     pub fn validate(&self) -> Result<(), Vec<VerifierError>> {
         let errors = SsaVerifier::new(self).verify(VerifyLevel::Standard);

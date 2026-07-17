@@ -98,7 +98,7 @@ pub enum ModificationScope {
 /// Most analyssa-side passes have a pure-function body in `crate::passes`
 /// and a one-line trait impl in the scheduling sub-module:
 ///
-/// ```ignore
+/// ```text
 /// impl<T: Target, H: SsaPassHost<T>> SsaPass<T, H> for MyPass {
 ///     fn name(&self) -> &'static str { "my-pass" }
 ///     fn run_on_method(&self, ssa: &mut SsaFunction<T>, method: &T::MethodRef, host: &H) -> Result<bool> {
